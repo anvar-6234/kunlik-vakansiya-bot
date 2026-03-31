@@ -756,34 +756,34 @@ class VacancyBot:
         )
         return REG_PHONE
 
-    async def reg_phone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.contact:
-        phone = update.message.contact.phone_number
-    else:
-        phone = update.message.text.strip()
-
-    context.user_data["reg_phone"] = phone
-
-    offer_text = (
-        "⬇ Ommaviy oferta ⬇\n\n"
-        "Botdan foydalanish orqali siz shartlarga rozilik bildirasiz.\n"
-        "Rozi bo'lsangiz 'Roziman' tugmasini bosing."
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Roziman", callback_data="accept_offer"),
-                InlineKeyboardButton("Rad etaman", callback_data="decline_offer"),
-            ]
-        ]
-    )
-
-    await update.message.reply_text(
-        offer_text,
-        reply_markup=keyboard,
-    )
-    return REG_OFFER
+        async def reg_phone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if update.message.contact:
+                phone = update.message.contact.phone_number
+            else:
+                phone = update.message.text.strip()
+    
+            context.user_data["reg_phone"] = phone
+    
+            offer_text = (
+                "⬇ Ommaviy oferta ⬇\n\n"
+                "Botdan foydalanish orqali siz shartlarga rozilik bildirasiz.\n"
+                "Rozi bo'lsangiz 'Roziman' tugmasini bosing."
+            )
+    
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Roziman", callback_data="accept_offer"),
+                        InlineKeyboardButton("Rad etaman", callback_data="decline_offer"),
+                    ]
+                ]
+            )
+    
+            await update.message.reply_text(
+                offer_text,
+                reply_markup=keyboard,
+            )
+        return REG_OFFER
 
     async def reg_offer_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
