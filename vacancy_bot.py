@@ -389,9 +389,6 @@ class VacancyBot:
         # Start command: greet user and prompt for registration or help
         self.application.add_handler(CommandHandler("start", self.start))
 
-        # Admin command to create a new vacancy
-        self.application.add_handler(CommandHandler("new_vacancy", self.new_vacancy_entry, filters.User(user_id=self.admin_ids)))
-
         # Conversation handler for new vacancy flow
         vacancy_conv = ConversationHandler(
             entry_points=[CommandHandler("new_vacancy", self.new_vacancy_entry, filters.User(user_id=self.admin_ids))],
