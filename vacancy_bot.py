@@ -3,7 +3,8 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from html import escape
+from typing import Dict, List, Optional
 
 from telegram import (
     InlineKeyboardButton,
@@ -32,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------- STATES --------------------
-(REG_NAME, REG_PHONE, REG_OFFER, REG_PASSPORT) = range(4)
+REG_NAME, REG_PHONE, REG_OFFER, REG_PASSPORT = range(4)
 
 (
     VAC_TITLE,
@@ -42,16 +43,23 @@ logger = logging.getLogger(__name__)
     VAC_SALARY,
     VAC_DEPOSIT,
     VAC_GEO,
-) = range(10, 17)
+    VAC_REVIEW,
+    VAC_EDIT_CHOICE,
+    VAC_EDIT_VALUE,
+) = range(10, 20)
 
 
-# -------------------- DATABASE --------------------
+# -------------------- DATABASE HELPERS --------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def get_conn(db_path: str) -> sqlite3.Connection:
+    return sqlite3.connect(db_path)
+
+
 def init_db(db_path: str) -> None:
-    conn = sqlite3.connect(db_path)
+    conn = get_conn(db_path)
     cur = conn.cursor()
 
     cur.execute(
@@ -60,10 +68,29 @@ def init_db(db_path: str) -> None:
             user_id INTEGER PRIMARY KEY,
             name TEXT,
             phone TEXT,
+            username TEXT,
             offer_accepted INTEGER DEFAULT 0,
             passport_file_id TEXT,
             approved INTEGER DEFAULT 0,
-            pending_vacancy_id INTEGER,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            vacancy_id INTEGER NOT NULL,
+            name TEXT,
+            phone TEXT,
+            username TEXT,
+            offer_accepted INTEGER DEFAULT 0,
+            passport_file_id TEXT,
+            status TEXT DEFAULT 'pending',
+            rejection_reason TEXT,
             created_at TEXT,
             updated_at TEXT
         )
@@ -82,7 +109,7 @@ def init_db(db_path: str) -> None:
             deposit INTEGER,
             latitude REAL,
             longitude REAL,
-            channel_message_id INTEGER,
+            channel_message_id INTEGER DEFAULT 0,
             remaining INTEGER,
             created_at TEXT
         )
@@ -93,13 +120,11 @@ def init_db(db_path: str) -> None:
         """
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vacancy_id INTEGER,
-            user_id INTEGER,
+            vacancy_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
             receipt_file_id TEXT,
             confirmed INTEGER DEFAULT 0,
-            created_at TEXT,
-            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
+            created_at TEXT
         )
         """
     )
@@ -108,16 +133,13 @@ def init_db(db_path: str) -> None:
     conn.close()
 
 
-def get_conn(db_path: str) -> sqlite3.Connection:
-    return sqlite3.connect(db_path)
-
-
+# -------------------- USER HELPERS --------------------
 def get_user(db_path: str, user_id: int) -> Optional[Dict]:
     conn = get_conn(db_path)
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT user_id, name, phone, offer_accepted, passport_file_id, approved, pending_vacancy_id
+        SELECT user_id, name, phone, username, offer_accepted, passport_file_id, approved
         FROM users
         WHERE user_id = ?
         """,
@@ -133,10 +155,10 @@ def get_user(db_path: str, user_id: int) -> Optional[Dict]:
         "user_id": row[0],
         "name": row[1],
         "phone": row[2],
-        "offer_accepted": bool(row[3]),
-        "passport_file_id": row[4],
-        "approved": bool(row[5]),
-        "pending_vacancy_id": row[6],
+        "username": row[3],
+        "offer_accepted": bool(row[4]),
+        "passport_file_id": row[5],
+        "approved": bool(row[6]),
     }
 
 
@@ -145,15 +167,16 @@ def upsert_user(
     user_id: int,
     name: Optional[str] = None,
     phone: Optional[str] = None,
+    username: Optional[str] = None,
     offer_accepted: Optional[bool] = None,
     passport_file_id: Optional[str] = None,
     approved: Optional[bool] = None,
-    pending_vacancy_id: Optional[int] = None,
 ) -> None:
     existing = get_user(db_path, user_id)
 
     final_name = name if name is not None else (existing["name"] if existing else None)
     final_phone = phone if phone is not None else (existing["phone"] if existing else None)
+    final_username = username if username is not None else (existing["username"] if existing else None)
     final_offer = (
         int(offer_accepted)
         if offer_accepted is not None
@@ -169,40 +192,34 @@ def upsert_user(
         if approved is not None
         else (1 if existing and existing["approved"] else 0)
     )
-    final_pending_vacancy = (
-        pending_vacancy_id
-        if pending_vacancy_id is not None
-        else (existing["pending_vacancy_id"] if existing else None)
-    )
 
     now = now_iso()
-
     conn = get_conn(db_path)
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO users (
-            user_id, name, phone, offer_accepted, passport_file_id,
-            approved, pending_vacancy_id, created_at, updated_at
+            user_id, name, phone, username, offer_accepted,
+            passport_file_id, approved, created_at, updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             name = excluded.name,
             phone = excluded.phone,
+            username = excluded.username,
             offer_accepted = excluded.offer_accepted,
             passport_file_id = excluded.passport_file_id,
             approved = excluded.approved,
-            pending_vacancy_id = excluded.pending_vacancy_id,
             updated_at = excluded.updated_at
         """,
         (
             user_id,
             final_name,
             final_phone,
+            final_username,
             final_offer,
             final_passport,
             final_approved,
-            final_pending_vacancy,
             now,
             now,
         ),
@@ -211,7 +228,172 @@ def upsert_user(
     conn.close()
 
 
-def add_vacancy(
+# -------------------- APPLICATION HELPERS --------------------
+def create_application(
+    db_path: str,
+    user_id: int,
+    vacancy_id: int,
+    name: str,
+    phone: str,
+    username: Optional[str],
+    offer_accepted: bool,
+    passport_file_id: str,
+) -> int:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO applications (
+            user_id, vacancy_id, name, phone, username, offer_accepted,
+            passport_file_id, status, rejection_reason, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+        """,
+        (
+            user_id,
+            vacancy_id,
+            name,
+            phone,
+            username,
+            int(offer_accepted),
+            passport_file_id,
+            now_iso(),
+            now_iso(),
+        ),
+    )
+    app_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return app_id
+
+
+def get_application(db_path: str, app_id: int) -> Optional[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, vacancy_id, name, phone, username, offer_accepted,
+               passport_file_id, status, rejection_reason
+        FROM applications
+        WHERE id = ?
+        """,
+        (app_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "vacancy_id": row[2],
+        "name": row[3],
+        "phone": row[4],
+        "username": row[5],
+        "offer_accepted": bool(row[6]),
+        "passport_file_id": row[7],
+        "status": row[8],
+        "rejection_reason": row[9],
+    }
+
+
+def update_application_status(
+    db_path: str,
+    app_id: int,
+    status: str,
+    rejection_reason: Optional[str] = None,
+) -> None:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE applications
+        SET status = ?, rejection_reason = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (status, rejection_reason, now_iso(), app_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_pending_application_for_user_and_vacancy(
+    db_path: str,
+    user_id: int,
+    vacancy_id: int,
+) -> Optional[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, vacancy_id, name, phone, username, offer_accepted,
+               passport_file_id, status, rejection_reason
+        FROM applications
+        WHERE user_id = ? AND vacancy_id = ? AND status = 'pending'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id, vacancy_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "vacancy_id": row[2],
+        "name": row[3],
+        "phone": row[4],
+        "username": row[5],
+        "offer_accepted": bool(row[6]),
+        "passport_file_id": row[7],
+        "status": row[8],
+        "rejection_reason": row[9],
+    }
+
+
+def list_rejected_applications_for_vacancy(db_path: str, vacancy_id: int) -> List[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, vacancy_id, name, phone, username, offer_accepted,
+               passport_file_id, status, rejection_reason
+        FROM applications
+        WHERE vacancy_id = ? AND status = 'rejected'
+        ORDER BY id ASC
+        """,
+        (vacancy_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "id": row[0],
+                "user_id": row[1],
+                "vacancy_id": row[2],
+                "name": row[3],
+                "phone": row[4],
+                "username": row[5],
+                "offer_accepted": bool(row[6]),
+                "passport_file_id": row[7],
+                "status": row[8],
+                "rejection_reason": row[9],
+            }
+        )
+    return result
+
+
+# -------------------- VACANCY HELPERS --------------------
+def create_vacancy(
     db_path: str,
     title: str,
     headcount: int,
@@ -221,7 +403,6 @@ def add_vacancy(
     deposit: int,
     latitude: Optional[float],
     longitude: Optional[float],
-    channel_message_id: int,
 ) -> int:
     conn = get_conn(db_path)
     cur = conn.cursor()
@@ -231,7 +412,7 @@ def add_vacancy(
             title, headcount, location_text, work_time, salary, deposit,
             latitude, longitude, channel_message_id, remaining, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         """,
         (
             title,
@@ -242,7 +423,6 @@ def add_vacancy(
             deposit,
             latitude,
             longitude,
-            channel_message_id,
             headcount,
             now_iso(),
         ),
@@ -253,13 +433,24 @@ def add_vacancy(
     return vacancy_id
 
 
+def set_vacancy_channel_message_id(db_path: str, vacancy_id: int, message_id: int) -> None:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE vacancies SET channel_message_id = ? WHERE id = ?",
+        (message_id, vacancy_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_vacancy(db_path: str, vacancy_id: int) -> Optional[Dict]:
     conn = get_conn(db_path)
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, title, headcount, location_text, work_time, salary, deposit,
-               latitude, longitude, channel_message_id, remaining
+        SELECT id, title, headcount, location_text, work_time, salary,
+               deposit, latitude, longitude, channel_message_id, remaining
         FROM vacancies
         WHERE id = ?
         """,
@@ -286,6 +477,42 @@ def get_vacancy(db_path: str, vacancy_id: int) -> Optional[Dict]:
     }
 
 
+def list_vacancies(db_path: str, limit: int = 50) -> List[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, title, headcount, location_text, work_time, salary,
+               deposit, latitude, longitude, channel_message_id, remaining
+        FROM vacancies
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "id": row[0],
+                "title": row[1],
+                "headcount": row[2],
+                "location_text": row[3],
+                "work_time": row[4],
+                "salary": row[5],
+                "deposit": row[6],
+                "latitude": row[7],
+                "longitude": row[8],
+                "channel_message_id": row[9],
+                "remaining": row[10],
+            }
+        )
+    return result
+
+
 def decrement_vacancy_remaining(db_path: str, vacancy_id: int) -> None:
     conn = get_conn(db_path)
     cur = conn.cursor()
@@ -297,22 +524,14 @@ def decrement_vacancy_remaining(db_path: str, vacancy_id: int) -> None:
     conn.close()
 
 
-def get_vacancy_remaining(db_path: str, vacancy_id: int) -> int:
-    conn = get_conn(db_path)
-    cur = conn.cursor()
-    cur.execute("SELECT remaining FROM vacancies WHERE id = ?", (vacancy_id,))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else 0
-
-
+# -------------------- BOOKING HELPERS --------------------
 def add_booking(db_path: str, vacancy_id: int, user_id: int) -> int:
     conn = get_conn(db_path)
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO bookings (vacancy_id, user_id, created_at)
-        VALUES (?, ?, ?)
+        INSERT INTO bookings (vacancy_id, user_id, receipt_file_id, confirmed, created_at)
+        VALUES (?, ?, NULL, 0, ?)
         """,
         (vacancy_id, user_id, now_iso()),
     )
@@ -348,10 +567,84 @@ def get_booking(db_path: str, booking_id: int) -> Optional[Dict]:
     }
 
 
+def get_latest_booking_for_user_vacancy(
+    db_path: str,
+    user_id: int,
+    vacancy_id: int,
+) -> Optional[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, vacancy_id, user_id, receipt_file_id, confirmed
+        FROM bookings
+        WHERE user_id = ? AND vacancy_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id, vacancy_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "vacancy_id": row[1],
+        "user_id": row[2],
+        "receipt_file_id": row[3],
+        "confirmed": bool(row[4]),
+    }
+
+
+def get_latest_open_booking_for_user(db_path: str, user_id: int) -> Optional[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, vacancy_id, user_id, receipt_file_id, confirmed
+        FROM bookings
+        WHERE user_id = ? AND confirmed = 0
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "vacancy_id": row[1],
+        "user_id": row[2],
+        "receipt_file_id": row[3],
+        "confirmed": bool(row[4]),
+    }
+
+
 def set_booking_receipt(db_path: str, booking_id: int, file_id: str) -> None:
     conn = get_conn(db_path)
     cur = conn.cursor()
-    cur.execute("UPDATE bookings SET receipt_file_id = ? WHERE id = ?", (file_id, booking_id))
+    cur.execute(
+        "UPDATE bookings SET receipt_file_id = ? WHERE id = ?",
+        (file_id, booking_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_booking_receipt(db_path: str, booking_id: int) -> None:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE bookings SET receipt_file_id = NULL WHERE id = ?",
+        (booking_id,),
+    )
     conn.commit()
     conn.close()
 
@@ -359,32 +652,98 @@ def set_booking_receipt(db_path: str, booking_id: int, file_id: str) -> None:
 def set_booking_confirmed(db_path: str, booking_id: int, confirmed: bool) -> None:
     conn = get_conn(db_path)
     cur = conn.cursor()
-    cur.execute("UPDATE bookings SET confirmed = ? WHERE id = ?", (int(confirmed), booking_id))
+    cur.execute(
+        "UPDATE bookings SET confirmed = ? WHERE id = ?",
+        (int(confirmed), booking_id),
+    )
     conn.commit()
     conn.close()
 
 
-# -------------------- BOT --------------------
+def list_confirmed_bookings_for_vacancy(db_path: str, vacancy_id: int) -> List[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT b.id, b.user_id, b.receipt_file_id, u.name, u.phone, u.username
+        FROM bookings b
+        LEFT JOIN users u ON u.user_id = b.user_id
+        WHERE b.vacancy_id = ? AND b.confirmed = 1
+        ORDER BY b.id ASC
+        """,
+        (vacancy_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "booking_id": row[0],
+                "user_id": row[1],
+                "receipt_file_id": row[2],
+                "name": row[3],
+                "phone": row[4],
+                "username": row[5],
+            }
+        )
+    return result
+
+
+def list_pending_bookings_for_vacancy(db_path: str, vacancy_id: int) -> List[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT b.id, b.user_id, b.receipt_file_id, u.name, u.phone, u.username
+        FROM bookings b
+        LEFT JOIN users u ON u.user_id = b.user_id
+        WHERE b.vacancy_id = ? AND b.confirmed = 0 AND b.receipt_file_id IS NOT NULL
+        ORDER BY b.id ASC
+        """,
+        (vacancy_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "booking_id": row[0],
+                "user_id": row[1],
+                "receipt_file_id": row[2],
+                "name": row[3],
+                "phone": row[4],
+                "username": row[5],
+            }
+        )
+    return result
+
+
+# -------------------- BOT CLASS --------------------
 class VacancyBot:
     def __init__(self) -> None:
         self.token = os.environ.get("BOT_TOKEN")
         if not self.token:
             raise RuntimeError("BOT_TOKEN environment variable not set")
 
-        self.bot_username = os.environ.get("BOT_USERNAME")
+        self.bot_username = os.environ.get("BOT_USERNAME", "").strip().lstrip("@")
         if not self.bot_username:
             raise RuntimeError("BOT_USERNAME environment variable not set")
 
         admins = os.environ.get("ADMIN_IDS")
         if not admins:
             raise RuntimeError("ADMIN_IDS environment variable not set")
+        self.admin_ids = [int(x.strip()) for x in admins.split(",") if x.strip()]
 
         channel_id_raw = os.environ.get("CHANNEL_ID")
         if not channel_id_raw:
             raise RuntimeError("CHANNEL_ID environment variable not set")
-
-        self.admin_ids = [int(x.strip()) for x in admins.split(",") if x.strip()]
         self.channel_id = int(channel_id_raw.strip())
+
+        self.channel_public_username = os.environ.get("CHANNEL_PUBLIC_USERNAME", "").strip().lstrip("@") or None
         self.card_number = os.environ.get("CARD_NUMBER", "")
         self.card_holder = os.environ.get("CARD_HOLDER", "")
 
@@ -393,8 +752,19 @@ class VacancyBot:
         self.db_path = os.path.join(data_dir, "vacancy_bot.sqlite3")
         init_db(self.db_path)
 
-        self.application = Application.builder().token(self.token).build()
         self.pending_bookings: Dict[int, int] = {}
+
+        self.admin_menu = ReplyKeyboardMarkup(
+            [["Yangi vakansiya qo'shish", "Statistika"]],
+            resize_keyboard=True,
+        )
+
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .concurrent_updates(False)
+            .build()
+        )
 
         self._register_handlers()
 
@@ -420,7 +790,11 @@ class VacancyBot:
                     "new_vacancy",
                     self.new_vacancy_entry,
                     filters=filters.User(user_id=self.admin_ids),
-                )
+                ),
+                MessageHandler(
+                    filters.Regex("^Yangi vakansiya qo'shish$") & filters.User(user_id=self.admin_ids),
+                    self.new_vacancy_entry,
+                ),
             ],
             states={
                 VAC_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_title)],
@@ -430,6 +804,14 @@ class VacancyBot:
                 VAC_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_salary)],
                 VAC_DEPOSIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_deposit)],
                 VAC_GEO: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, self.vacancy_geo)],
+                VAC_REVIEW: [CallbackQueryHandler(self.vacancy_review_callback, pattern=r"^vac_(approve|reject)$")],
+                VAC_EDIT_CHOICE: [
+                    CallbackQueryHandler(
+                        self.vacancy_edit_choice_callback,
+                        pattern=r"^vac_edit:(title|headcount|location_text|work_time|salary|deposit|geo|cancel)$",
+                    )
+                ],
+                VAC_EDIT_VALUE: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, self.vacancy_edit_value)],
             },
             fallbacks=[CommandHandler("cancel", self.cancel)],
             per_chat=True,
@@ -439,22 +821,141 @@ class VacancyBot:
         self.application.add_handler(vacancy_conv)
 
         self.application.add_handler(
-            CallbackQueryHandler(self.admin_approve_registration, pattern=r"^approve_reg:(\d+)$")
+            MessageHandler(
+                filters.Regex("^Statistika$") & filters.User(user_id=self.admin_ids),
+                self.stats_entry,
+            )
         )
         self.application.add_handler(
-            CallbackQueryHandler(self.admin_reject_registration, pattern=r"^reject_reg:(\d+)$")
+            CommandHandler(
+                "stats",
+                self.stats_entry,
+                filters=filters.User(user_id=self.admin_ids),
+            )
         )
-        self.application.add_handler(
-            CallbackQueryHandler(self.admin_confirm_receipt, pattern=r"^confirm_receipt:(\d+):(\d+)$")
-        )
-        self.application.add_handler(
-            CallbackQueryHandler(self.admin_decline_receipt, pattern=r"^decline_receipt:(\d+):(\d+)$")
-        )
+
+        self.application.add_handler(CallbackQueryHandler(self.stats_vacancy_callback, pattern=r"^stat_vac:(\d+)$"))
+        self.application.add_handler(CallbackQueryHandler(self.show_receipt_callback, pattern=r"^show_receipt:(\d+)$"))
+        self.application.add_handler(CallbackQueryHandler(self.admin_approve_registration, pattern=r"^approve_app:(\d+)$"))
+        self.application.add_handler(CallbackQueryHandler(self.admin_reject_registration, pattern=r"^reject_app:(\d+)$"))
+        self.application.add_handler(CallbackQueryHandler(self.admin_confirm_receipt, pattern=r"^confirm_receipt:(\d+):(\d+)$"))
+        self.application.add_handler(CallbackQueryHandler(self.admin_decline_receipt, pattern=r"^decline_receipt:(\d+):(\d+)$"))
 
         self.application.add_handler(MessageHandler(filters.PHOTO, self.global_photo_handler))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.generic_text_handler))
+        self.application.add_error_handler(self.error_handler)
 
-    # -------------------- HELPERS --------------------
+    # -------------------- GENERIC HELPERS --------------------
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.admin_ids
+
+    def build_vacancy_caption(self, data: Dict) -> str:
+        return (
+            f"#{data['headcount']} vakansiya\n\n"
+            f"Vakansiya nomi: {data['title']}\n"
+            f"Necha kishi kerak: {data['headcount']}\n"
+            f"Lokatsiya (yozma): {data['location_text']}\n"
+            f"Ish vaqti: {data['work_time']}\n"
+            f"Xizmati haqi: {data['salary']}\n"
+            f"Bron qilish narxi: {data['deposit']} so'm\n"
+        )
+
+    def build_channel_post_link(self, message_id: int) -> str:
+        if self.channel_public_username:
+            return f"https://t.me/{self.channel_public_username}/{message_id}"
+
+        internal = str(abs(self.channel_id))
+        if internal.startswith("100"):
+            internal = internal[3:]
+        return f"https://t.me/c/{internal}/{message_id}"
+
+    def build_user_line(self, user_id: int, name: Optional[str], phone: Optional[str], username: Optional[str]) -> str:
+        display = escape(name or username or f"Foydalanuvchi {user_id}")
+        mention = f'<a href="tg://user?id={user_id}">{display}</a>'
+        parts = [mention]
+
+        if phone:
+            parts.append(escape(phone))
+        if username:
+            uname = escape(username.lstrip("@"))
+            parts.append(f'<a href="https://t.me/{uname}">@{uname}</a>')
+
+        return " – ".join(parts)
+
+    async def show_admin_menu(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Admin menyu tayyor.",
+            reply_markup=self.admin_menu,
+        )
+
+    async def show_vacancy_preview(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+        data = context.user_data["vacancy_draft"]
+        caption = "📋 Vakansiya preview:\n\n" + self.build_vacancy_caption(data)
+
+        if data.get("latitude") is not None and data.get("longitude") is not None:
+            caption += "\n📍 Geolokatsiya qo'shilgan"
+        else:
+            caption += "\n📍 Geolokatsiya yo'q"
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Tasdiqlayman", callback_data="vac_approve"),
+                    InlineKeyboardButton("Tasdiqlamayman", callback_data="vac_reject"),
+                ]
+            ]
+        )
+        await context.bot.send_message(chat_id=chat_id, text=caption, reply_markup=keyboard)
+
+    async def publish_vacancy_from_draft(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
+        data = context.user_data["vacancy_draft"]
+        vac_id = create_vacancy(
+            self.db_path,
+            title=data["title"],
+            headcount=data["headcount"],
+            location_text=data["location_text"],
+            work_time=data["work_time"],
+            salary=data["salary"],
+            deposit=data["deposit"],
+            latitude=data.get("latitude"),
+            longitude=data.get("longitude"),
+        )
+
+        temp_keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Ishni bron qilish",
+                        url=f"https://t.me/{self.bot_username}?start=book_{vac_id}",
+                    )
+                ]
+            ]
+        )
+
+        msg: Message = await context.bot.send_message(
+            chat_id=self.channel_id,
+            text=self.build_vacancy_caption(data),
+            reply_markup=temp_keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+
+        set_vacancy_channel_message_id(self.db_path, vac_id, msg.message_id)
+
+        if data.get("latitude") is not None and data.get("longitude") is not None:
+            await context.bot.send_location(
+                chat_id=self.channel_id,
+                latitude=data["latitude"],
+                longitude=data["longitude"],
+            )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Vakansiya kanalga yuborildi (ID: {vac_id}).",
+            reply_markup=self.admin_menu,
+        )
+        return vac_id
+
     async def send_booking_payment_message(
         self,
         chat_id: int,
@@ -471,7 +972,24 @@ class VacancyBot:
             await context.bot.send_message(chat_id=chat_id, text="Kechirasiz, bu vakansiyada joy qolmagan.")
             return
 
-        booking_id = add_booking(self.db_path, vacancy_id, user_id)
+        existing = get_latest_booking_for_user_vacancy(self.db_path, user_id, vacancy_id)
+
+        if existing:
+            if existing["confirmed"]:
+                await self.send_confirmed_booking_details(user_id, vacancy_id, context)
+                return
+
+            if existing["receipt_file_id"]:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Siz bu vakansiya uchun chek yuborgansiz. Admin tasdig'ini kuting.",
+                )
+                return
+
+            booking_id = existing["id"]
+        else:
+            booking_id = add_booking(self.db_path, vacancy_id, user_id)
+
         self.pending_bookings[user_id] = booking_id
 
         text = (
@@ -489,30 +1007,76 @@ class VacancyBot:
 
     async def send_welcome_and_continue(
         self,
-        user_id: int,
+        app_id: int,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        user = get_user(self.db_path, user_id)
-        if not user:
+        app = get_application(self.db_path, app_id)
+        if not app:
             return
 
-        name = user.get("name") or "foydalanuvchi"
-        pending_vacancy_id = user.get("pending_vacancy_id")
-
+        name = escape(app["name"] or "foydalanuvchi")
         await context.bot.send_message(
-            chat_id=user_id,
+            chat_id=app["user_id"],
             text=(
                 f"Hurmatli {name} sizni Kunlik vakansiya jamoasiga qabul qilinganingiz bilan tabriklayman.\n\n"
                 f"Quyida ish bilan batafsil tanishishingiz va bron qilishingiz mumkin!"
             ),
+            parse_mode=ParseMode.HTML,
         )
 
-        if pending_vacancy_id:
-            await self.send_booking_payment_message(
+        await self.send_booking_payment_message(
+            chat_id=app["user_id"],
+            vacancy_id=app["vacancy_id"],
+            user_id=app["user_id"],
+            context=context,
+        )
+
+    async def send_confirmed_booking_details(
+        self,
+        user_id: int,
+        vacancy_id: int,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        user = get_user(self.db_path, user_id)
+        vacancy = get_vacancy(self.db_path, vacancy_id)
+
+        if not user or not vacancy:
+            return
+
+        link = self.build_channel_post_link(vacancy["channel_message_id"])
+        vacancy_name_link = f'<a href="{link}">{escape(vacancy["title"])}</a>'
+
+        text = (
+            f"Hurmatli {escape(user['name'] or 'foydalanuvchi')}, siz {vacancy_name_link} "
+            f"ishi uchun joy bron qildingiz.\n\n"
+            f"Pastda qo'shimcha tafsilotlar va lokatsiya yuboryapman, iltimos aytilgan joyga kechikmay keling!"
+        )
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+        try:
+            await context.bot.copy_message(
                 chat_id=user_id,
-                vacancy_id=pending_vacancy_id,
-                user_id=user_id,
-                context=context,
+                from_chat_id=self.channel_id,
+                message_id=vacancy["channel_message_id"],
+            )
+        except Exception as exc:
+            logger.warning(f"copy_message failed: {exc}")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=self.build_vacancy_caption(vacancy),
+            )
+
+        if vacancy.get("latitude") is not None and vacancy.get("longitude") is not None:
+            await context.bot.send_location(
+                chat_id=user_id,
+                latitude=vacancy["latitude"],
+                longitude=vacancy["longitude"],
             )
 
     async def send_vacancy_remaining_notice(
@@ -524,41 +1088,126 @@ class VacancyBot:
         if not vacancy:
             return
 
-        remaining = vacancy["remaining"]
-
-        if remaining <= 0:
+        if vacancy["remaining"] <= 0:
             try:
                 await context.bot.edit_message_text(
                     chat_id=self.channel_id,
                     message_id=vacancy["channel_message_id"],
-                    text=(
-                        f"#{vacancy['headcount']} vakansiya\n\n"
-                        f"Vakansiya nomi: {vacancy['title']}\n"
-                        f"Necha kishi kerak: {vacancy['headcount']}\n"
-                        f"Lokatsiya (yozma): {vacancy['location_text']}\n"
-                        f"Ish vaqti: {vacancy['work_time']}\n"
-                        f"Xizmati haqi: {vacancy['salary']}\n"
-                        f"Bron qilish narxi: {vacancy['deposit']} so'm\n\n"
-                        f"❌ Ish joylari qolmadi! Rahmat )"
-                    ),
+                    text=self.build_vacancy_caption(vacancy) + "\n❌ Ish joylari qolmadi! Rahmat )",
                     reply_markup=None,
                 )
             except Exception as exc:
-                logger.warning(f"Channel post edit failed: {exc}")
+                logger.warning(f"edit channel post failed: {exc}")
         else:
             try:
                 await context.bot.send_message(
                     chat_id=self.channel_id,
-                    text=f"Vakansiya uchun {remaining}/{vacancy['headcount']} bo'sh joy qoldi. Shoshiling!",
+                    text=f"Vakansiya uchun {vacancy['remaining']}/{vacancy['headcount']} bo'sh joy qoldi. Shoshiling!",
                     reply_to_message_id=vacancy["channel_message_id"],
                 )
             except Exception as exc:
-                logger.warning(f"Remaining notice failed: {exc}")
+                logger.warning(f"remaining notice failed: {exc}")
 
-    # -------------------- GENERAL --------------------
+    async def send_stats_for_vacancy(
+        self,
+        chat_id: int,
+        vacancy_id: int,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        vacancy = get_vacancy(self.db_path, vacancy_id)
+        if not vacancy:
+            await context.bot.send_message(chat_id=chat_id, text="Vakansiya topilmadi.")
+            return
+
+        confirmed = list_confirmed_bookings_for_vacancy(self.db_path, vacancy_id)
+        pending = list_pending_bookings_for_vacancy(self.db_path, vacancy_id)
+        rejected = list_rejected_applications_for_vacancy(self.db_path, vacancy_id)
+
+        lines: List[str] = []
+
+        if vacancy["remaining"] <= 0:
+            lines.append("<b>Bu vakansiya bo'yicha ishchilar ro'yxati to'lgan:</b>")
+        else:
+            lines.append(f"<b>{escape(vacancy['title'])}</b>")
+            lines.append(
+                f"Bo'sh joy: {vacancy['remaining']}/{vacancy['headcount']}"
+            )
+
+        lines.append("")
+        lines.append(f"<b>1. Bron qilganlar soni:</b> {len(confirmed)}")
+
+        if confirmed:
+            for idx, item in enumerate(confirmed, start=1):
+                lines.append(
+                    f"– bron qilgan foydalanuvchi #{idx}: "
+                    f"{self.build_user_line(item['user_id'], item['name'], item['phone'], item['username'])}"
+                )
+        else:
+            lines.append("– yo'q")
+
+        lines.append("")
+        lines.append(f"<b>2. Pendingda turganlar soni:</b> {len(pending)}")
+
+        if pending:
+            for idx, item in enumerate(pending, start=1):
+                lines.append(
+                    f"– pending foydalanuvchi #{idx}: "
+                    f"{self.build_user_line(item['user_id'], item['name'], item['phone'], item['username'])}"
+                )
+        else:
+            lines.append("– yo'q")
+
+        lines.append("")
+        lines.append(f"<b>3. To'g'ri kelmaganlar soni:</b> {len(rejected)}")
+
+        if rejected:
+            for idx, item in enumerate(rejected, start=1):
+                lines.append(
+                    f"– rad etilgan foydalanuvchi #{idx}: "
+                    f"{self.build_user_line(item['user_id'], item['name'], item['phone'], item['username'])}"
+                )
+                if item.get("rejection_reason"):
+                    lines.append(f"  Sabab: {escape(item['rejection_reason'])}")
+        else:
+            lines.append("– yo'q")
+
+        buttons: List[List[InlineKeyboardButton]] = []
+        receipt_buttons: List[InlineKeyboardButton] = []
+
+        for idx, item in enumerate(confirmed, start=1):
+            receipt_buttons.append(
+                InlineKeyboardButton(f"✅ Chek {idx}", callback_data=f"show_receipt:{item['booking_id']}")
+            )
+        for idx, item in enumerate(pending, start=1):
+            receipt_buttons.append(
+                InlineKeyboardButton(f"⏳ Pending chek {idx}", callback_data=f"show_receipt:{item['booking_id']}")
+            )
+
+        if receipt_buttons:
+            for i in range(0, len(receipt_buttons), 2):
+                buttons.append(receipt_buttons[i : i + 2])
+            lines.append("")
+            lines.append("Cheklarni ko'rish uchun pastdagi tugmalardan foydalaning.")
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+        )
+
+    # -------------------- ERROR HANDLER --------------------
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.exception("Unhandled error: %s", context.error)
+
+    # -------------------- GENERAL HANDLERS --------------------
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if update.message:
-            await update.message.reply_text("Jarayon bekor qilindi.", reply_markup=ReplyKeyboardRemove())
+            if self.is_admin(update.effective_user.id):
+                await update.message.reply_text("Jarayon bekor qilindi.", reply_markup=self.admin_menu)
+            else:
+                await update.message.reply_text("Jarayon bekor qilindi.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
     async def start_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -577,8 +1226,6 @@ class VacancyBot:
                 await update.message.reply_text("Vakansiya ma'lumoti noto'g'ri.")
                 return ConversationHandler.END
 
-            context.user_data["pending_vacancy_id"] = vacancy_id
-
             user_record = get_user(self.db_path, user.id)
 
             if user_record and user_record.get("approved"):
@@ -590,155 +1237,191 @@ class VacancyBot:
                 )
                 return ConversationHandler.END
 
-            if user_record and user_record.get("passport_file_id") and not user_record.get("approved"):
-                upsert_user(self.db_path, user.id, pending_vacancy_id=vacancy_id)
-                await update.message.reply_text(
-                    "Sizning ma'lumotlaringiz oldin yuborilgan. Admin tasdig'ini kuting."
-                )
+            pending_app = get_pending_application_for_user_and_vacancy(self.db_path, user.id, vacancy_id)
+            if pending_app:
+                await update.message.reply_text("Sizning ma'lumotlaringiz yuborilgan. Admin tasdig'ini kuting.")
                 return ConversationHandler.END
 
+            context.user_data["pending_vacancy_id"] = vacancy_id
             await update.message.reply_text("Ism va familiyangizni kiriting:")
             return REG_NAME
 
-        await update.message.reply_text(
-            "Assalomu alaykum! 👋\n\n"
-            "Bu bot orqali kunlik vakansiyalarni ko'rishingiz va ishni bron qilishingiz mumkin. "
-            "Kanaldagi 'Ishni bron qilish' tugmasini bosing."
-        )
+        if self.is_admin(user.id):
+            await update.message.reply_text(
+                "Assalomu alaykum, admin! Quyidagi tugmalardan foydalaning.",
+                reply_markup=self.admin_menu,
+            )
+        else:
+            await update.message.reply_text(
+                "Assalomu alaykum! 👋\n\n"
+                "Bu bot orqali kunlik vakansiyalarni ko'rishingiz va ishni bron qilishingiz mumkin.\n"
+                "Kanaldagi 'Ishni bron qilish' tugmasini bosing."
+            )
         return ConversationHandler.END
 
     # -------------------- VACANCY CREATION --------------------
     async def new_vacancy_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message:
             return ConversationHandler.END
-        await update.message.reply_text("Vakansiya nomini kiriting:")
+
+        context.user_data["vacancy_draft"] = {
+            "title": "",
+            "headcount": 0,
+            "location_text": "",
+            "work_time": "",
+            "salary": "",
+            "deposit": 0,
+            "latitude": None,
+            "longitude": None,
+        }
+
+        await update.message.reply_text("Vakansiya nomini kiriting:", reply_markup=ReplyKeyboardRemove())
         return VAC_TITLE
 
     async def vacancy_title(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data["vac_title"] = update.message.text.strip()
+        context.user_data["vacancy_draft"]["title"] = update.message.text.strip()
         await update.message.reply_text("Necha kishi kerak (raqam)?")
         return VAC_HEADCOUNT
 
     async def vacancy_headcount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
-            headcount = int(update.message.text.strip())
+            value = int(update.message.text.strip())
         except ValueError:
             await update.message.reply_text("Iltimos, raqam kiriting.")
             return VAC_HEADCOUNT
 
-        context.user_data["vac_headcount"] = headcount
+        context.user_data["vacancy_draft"]["headcount"] = value
         await update.message.reply_text("Lokatsiya (yozma) kiriting:")
         return VAC_LOCATION_TEXT
 
     async def vacancy_location_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data["vac_location_text"] = update.message.text.strip()
+        context.user_data["vacancy_draft"]["location_text"] = update.message.text.strip()
         await update.message.reply_text("Ish vaqti:")
         return VAC_WORKTIME
 
     async def vacancy_work_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data["vac_work_time"] = update.message.text.strip()
+        context.user_data["vacancy_draft"]["work_time"] = update.message.text.strip()
         await update.message.reply_text("Xizmati haqi:")
         return VAC_SALARY
 
     async def vacancy_salary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data["vac_salary"] = update.message.text.strip()
+        context.user_data["vacancy_draft"]["salary"] = update.message.text.strip()
         await update.message.reply_text("Bron qilish narxi (faqat raqam):")
         return VAC_DEPOSIT
 
     async def vacancy_deposit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip().replace(" ", "")
         try:
-            deposit = int(text)
+            value = int(update.message.text.strip().replace(" ", ""))
         except ValueError:
             await update.message.reply_text("Bron narxini faqat raqam bilan kiriting.")
             return VAC_DEPOSIT
 
-        context.user_data["vac_deposit"] = deposit
+        context.user_data["vacancy_draft"]["deposit"] = value
         await update.message.reply_text("Geolokatsiya yuboring yoki 'yo'q' deb yozing:")
         return VAC_GEO
 
     async def vacancy_geo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        latitude = None
-        longitude = None
-
         if update.message.location:
-            latitude = update.message.location.latitude
-            longitude = update.message.location.longitude
+            context.user_data["vacancy_draft"]["latitude"] = update.message.location.latitude
+            context.user_data["vacancy_draft"]["longitude"] = update.message.location.longitude
         elif update.message.text and update.message.text.strip().lower() == "yo'q":
-            pass
+            context.user_data["vacancy_draft"]["latitude"] = None
+            context.user_data["vacancy_draft"]["longitude"] = None
         else:
             await update.message.reply_text("Iltimos, geopoziya yuboring yoki 'yo'q' deb yozing.")
             return VAC_GEO
 
-        title = context.user_data.get("vac_title")
-        headcount = context.user_data.get("vac_headcount")
-        loc_text = context.user_data.get("vac_location_text")
-        work_time = context.user_data.get("vac_work_time")
-        salary = context.user_data.get("vac_salary")
-        deposit = context.user_data.get("vac_deposit")
+        await self.show_vacancy_preview(update.effective_chat.id, context)
+        return VAC_REVIEW
 
-        caption = (
-            f"#{headcount} vakansiya\n\n"
-            f"Vakansiya nomi: {title}\n"
-            f"Necha kishi kerak: {headcount}\n"
-            f"Lokatsiya (yozma): {loc_text}\n"
-            f"Ish vaqti: {work_time}\n"
-            f"Xizmati haqi: {salary}\n"
-            f"Bron qilish narxi: {deposit} so'm\n"
-        )
+    async def vacancy_review_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
 
-        temp_keyboard = InlineKeyboardMarkup(
+        if query.data == "vac_approve":
+            await self.publish_vacancy_from_draft(query.message.chat_id, context)
+            return ConversationHandler.END
+
+        field_keyboard = InlineKeyboardMarkup(
             [
-                [
-                    InlineKeyboardButton(
-                        "Ishni bron qilish",
-                        url=f"https://t.me/{self.bot_username}?start=book_0",
-                    )
-                ]
+                [InlineKeyboardButton("Vakansiya nomi", callback_data="vac_edit:title")],
+                [InlineKeyboardButton("Necha kishi kerak", callback_data="vac_edit:headcount")],
+                [InlineKeyboardButton("Lokatsiya (yozma)", callback_data="vac_edit:location_text")],
+                [InlineKeyboardButton("Ish vaqti", callback_data="vac_edit:work_time")],
+                [InlineKeyboardButton("Xizmati haqi", callback_data="vac_edit:salary")],
+                [InlineKeyboardButton("Bron qilish narxi", callback_data="vac_edit:deposit")],
+                [InlineKeyboardButton("Geolokatsiya", callback_data="vac_edit:geo")],
+                [InlineKeyboardButton("Bekor qilish", callback_data="vac_edit:cancel")],
             ]
         )
-
-        msg: Message = await context.bot.send_message(
-            chat_id=self.channel_id,
-            text=caption,
-            reply_markup=temp_keyboard,
-            parse_mode=ParseMode.HTML,
+        await query.message.reply_text(
+            "Qaysi qismini o'zgartirmoqchisiz?",
+            reply_markup=field_keyboard,
         )
+        return VAC_EDIT_CHOICE
 
-        if latitude is not None and longitude is not None:
-            await context.bot.send_location(
-                chat_id=self.channel_id,
-                latitude=latitude,
-                longitude=longitude,
-            )
+    async def vacancy_edit_choice_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
 
-        vac_id = add_vacancy(
-            self.db_path,
-            title=title,
-            headcount=headcount,
-            location_text=loc_text,
-            work_time=work_time,
-            salary=salary,
-            deposit=deposit,
-            latitude=latitude,
-            longitude=longitude,
-            channel_message_id=msg.message_id,
-        )
+        choice = query.data.split(":", 1)[1]
 
-        real_keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "Ishni bron qilish",
-                        url=f"https://t.me/{self.bot_username}?start=book_{vac_id}",
-                    )
-                ]
-            ]
-        )
-        await msg.edit_reply_markup(reply_markup=real_keyboard)
+        if choice == "cancel":
+            await self.show_vacancy_preview(query.message.chat_id, context)
+            return VAC_REVIEW
 
-        await update.message.reply_text(f"Vakansiya kanalga yuborildi (ID: {vac_id}).")
-        return ConversationHandler.END
+        context.user_data["vacancy_edit_field"] = choice
+
+        prompts = {
+            "title": "Yangi vakansiya nomini kiriting:",
+            "headcount": "Yangi kishi sonini kiriting:",
+            "location_text": "Yangi lokatsiya (yozma) ni kiriting:",
+            "work_time": "Yangi ish vaqtini kiriting:",
+            "salary": "Yangi xizmat haqini kiriting:",
+            "deposit": "Yangi bron narxini kiriting:",
+            "geo": "Yangi geolokatsiyani yuboring yoki 'yo'q' deb yozing:",
+        }
+
+        await query.message.reply_text(prompts[choice])
+        return VAC_EDIT_VALUE
+
+    async def vacancy_edit_value(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        field = context.user_data.get("vacancy_edit_field")
+        draft = context.user_data["vacancy_draft"]
+
+        if field == "geo":
+            if update.message.location:
+                draft["latitude"] = update.message.location.latitude
+                draft["longitude"] = update.message.location.longitude
+            elif update.message.text and update.message.text.strip().lower() == "yo'q":
+                draft["latitude"] = None
+                draft["longitude"] = None
+            else:
+                await update.message.reply_text("Geolokatsiya yuboring yoki 'yo'q' deb yozing.")
+                return VAC_EDIT_VALUE
+        elif field == "headcount":
+            try:
+                draft["headcount"] = int(update.message.text.strip())
+            except ValueError:
+                await update.message.reply_text("Iltimos, raqam kiriting.")
+                return VAC_EDIT_VALUE
+        elif field == "deposit":
+            try:
+                draft["deposit"] = int(update.message.text.strip().replace(" ", ""))
+            except ValueError:
+                await update.message.reply_text("Iltimos, raqam kiriting.")
+                return VAC_EDIT_VALUE
+        else:
+            mapping = {
+                "title": "title",
+                "location_text": "location_text",
+                "work_time": "work_time",
+                "salary": "salary",
+            }
+            draft[mapping[field]] = update.message.text.strip()
+
+        await self.show_vacancy_preview(update.effective_chat.id, context)
+        return VAC_REVIEW
 
     # -------------------- REGISTRATION --------------------
     async def reg_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -766,6 +1449,11 @@ class VacancyBot:
             phone = update.message.text.strip()
 
         context.user_data["reg_phone"] = phone
+
+        await update.message.reply_text(
+            "Telefon raqami qabul qilindi.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
         offer_text = (
             "📝 Foydalanuvchi ofertasi\n\n"
@@ -821,22 +1509,41 @@ class VacancyBot:
             return REG_PASSPORT
 
         file_id = update.message.photo[-1].file_id
-        user_id = update.effective_user.id
-        pending_vacancy_id = context.user_data.get("pending_vacancy_id")
+        user = update.effective_user
+        vacancy_id = context.user_data.get("pending_vacancy_id")
+
+        if not vacancy_id:
+            await update.message.reply_text("Vakansiya aniqlanmadi. Qayta urinib ko'ring.")
+            return ConversationHandler.END
 
         upsert_user(
             self.db_path,
-            user_id=user_id,
+            user_id=user.id,
             name=context.user_data.get("reg_name"),
             phone=context.user_data.get("reg_phone"),
+            username=user.username,
             offer_accepted=True,
             passport_file_id=file_id,
             approved=False,
-            pending_vacancy_id=pending_vacancy_id,
         )
 
+        app_id = create_application(
+            self.db_path,
+            user_id=user.id,
+            vacancy_id=vacancy_id,
+            name=context.user_data.get("reg_name"),
+            phone=context.user_data.get("reg_phone"),
+            username=user.username,
+            offer_accepted=True,
+            passport_file_id=file_id,
+        )
+
+        vacancy = get_vacancy(self.db_path, vacancy_id)
+        vacancy_name = vacancy["title"] if vacancy else f"Vakansiya #{vacancy_id}"
+
         text = (
-            f"#{user_id} yangi foydalanuvchi:\n"
+            f"#{app_id} yangi foydalanuvchi arizasi:\n"
+            f"Vakansiya: {vacancy_name}\n"
             f"Ismi: {context.user_data.get('reg_name')}\n"
             f"Telefon raqami: {context.user_data.get('reg_phone')}\n"
             f"Ommaviy ofertaga rozilik: rozi ✅\n"
@@ -846,8 +1553,8 @@ class VacancyBot:
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("Tasdiqlayman", callback_data=f"approve_reg:{user_id}"),
-                    InlineKeyboardButton("Tasdiqlamayman", callback_data=f"reject_reg:{user_id}"),
+                    InlineKeyboardButton("Tasdiqlayman", callback_data=f"approve_app:{app_id}"),
+                    InlineKeyboardButton("Tasdiqlamayman", callback_data=f"reject_app:{app_id}"),
                 ]
             ]
         )
@@ -860,39 +1567,64 @@ class VacancyBot:
                 logger.warning(f"Failed to notify admin {admin_id}: {exc}")
 
         await update.message.reply_text(
-            "Ma'lumotlaringiz yuborildi. Admin tasdig'ini kuting.",
-            reply_markup=ReplyKeyboardRemove(),
+            "Ma'lumotlaringiz yuborildi. Admin tasdig'ini kuting."
         )
         return ConversationHandler.END
 
-    # -------------------- ADMIN APPROVAL --------------------
+    # -------------------- ADMIN APPLICATION REVIEW --------------------
     async def admin_approve_registration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
 
+        if not self.is_admin(query.from_user.id):
+            return
+
         try:
-            user_id = int(query.data.split(":")[1])
+            app_id = int(query.data.split(":")[1])
         except (IndexError, ValueError):
             await query.message.reply_text("Noto'g'ri ma'lumot.")
             return
 
-        upsert_user(self.db_path, user_id=user_id, approved=True)
-        await self.send_welcome_and_continue(user_id=user_id, context=context)
+        app = get_application(self.db_path, app_id)
+        if not app:
+            await query.message.reply_text("Ariza topilmadi.")
+            return
+
+        update_application_status(self.db_path, app_id, "approved", None)
+        upsert_user(
+            self.db_path,
+            user_id=app["user_id"],
+            name=app["name"],
+            phone=app["phone"],
+            username=app["username"],
+            offer_accepted=app["offer_accepted"],
+            passport_file_id=app["passport_file_id"],
+            approved=True,
+        )
+
+        await self.send_welcome_and_continue(app_id, context)
         await query.message.edit_text("Foydalanuvchi tasdiqlandi.")
 
     async def admin_reject_registration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
 
+        if not self.is_admin(query.from_user.id):
+            return
+
         try:
-            user_id = int(query.data.split(":")[1])
+            app_id = int(query.data.split(":")[1])
         except (IndexError, ValueError):
             await query.message.reply_text("Noto'g'ri ma'lumot.")
             return
 
-        context.chat_data["pending_rejection_user"] = user_id
-        user = get_user(self.db_path, user_id)
-        user_name = user["name"] if user and user.get("name") else "foydalanuvchi"
+        app = get_application(self.db_path, app_id)
+        if not app:
+            await query.message.reply_text("Ariza topilmadi.")
+            return
+
+        context.chat_data["pending_rejection_app_id"] = app_id
+        user_name = app["name"] or "foydalanuvchi"
 
         await query.message.reply_text(
             f"{user_name} Boss, nega bu foydalanuvchini tasdiqlamadingiz? Dal*ayobmisiz?\n\nSababni yozing:"
@@ -902,24 +1634,105 @@ class VacancyBot:
         except Exception:
             pass
 
-    # -------------------- TEXT / PHOTO GLOBAL --------------------
+    # -------------------- ADMIN STATS --------------------
+    async def stats_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message or not self.is_admin(update.effective_user.id):
+            return
+
+        vacancies = list_vacancies(self.db_path, limit=50)
+        if not vacancies:
+            await update.message.reply_text("Hali vakansiyalar yo'q.", reply_markup=self.admin_menu)
+            return
+
+        buttons = []
+        for vac in vacancies:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"{vac['id']}. {vac['title']} ({vac['remaining']}/{vac['headcount']})",
+                        callback_data=f"stat_vac:{vac['id']}",
+                    )
+                ]
+            )
+
+        await update.message.reply_text(
+            "Vakansiyani tanlang:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def stats_vacancy_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+
+        if not self.is_admin(query.from_user.id):
+            return
+
+        try:
+            vacancy_id = int(query.data.split(":")[1])
+        except (IndexError, ValueError):
+            await query.message.reply_text("Noto'g'ri ma'lumot.")
+            return
+
+        await self.send_stats_for_vacancy(query.message.chat_id, vacancy_id, context)
+
+    async def show_receipt_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+
+        if not self.is_admin(query.from_user.id):
+            return
+
+        try:
+            booking_id = int(query.data.split(":")[1])
+        except (IndexError, ValueError):
+            await query.message.reply_text("Noto'g'ri ma'lumot.")
+            return
+
+        booking = get_booking(self.db_path, booking_id)
+        if not booking or not booking.get("receipt_file_id"):
+            await query.message.reply_text("Chek topilmadi.")
+            return
+
+        user = get_user(self.db_path, booking["user_id"])
+        vacancy = get_vacancy(self.db_path, booking["vacancy_id"])
+
+        caption = (
+            f"Chek\n"
+            f"Foydalanuvchi: {user['name'] if user else booking['user_id']}\n"
+            f"Telefon: {user['phone'] if user else '-'}\n"
+            f"Vakansiya: {vacancy['title'] if vacancy else booking['vacancy_id']}\n"
+            f"Holat: {'tasdiqlangan' if booking['confirmed'] else 'pending'}"
+        )
+
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=booking["receipt_file_id"],
+            caption=caption,
+        )
+
+    # -------------------- GLOBAL TEXT / PHOTO --------------------
     async def generic_text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.effective_user:
             return
 
         user_id = update.effective_user.id
 
-        if user_id in self.admin_ids and "pending_rejection_user" in context.chat_data:
-            rejected_user_id = context.chat_data.pop("pending_rejection_user")
+        if self.is_admin(user_id) and "pending_rejection_app_id" in context.chat_data:
+            app_id = context.chat_data.pop("pending_rejection_app_id")
             reason = update.message.text.strip()
-            rejected_user = get_user(self.db_path, rejected_user_id)
-            rejected_name = rejected_user["name"] if rejected_user and rejected_user.get("name") else "foydalanuvchi"
+
+            app = get_application(self.db_path, app_id)
+            if not app:
+                await update.message.reply_text("Ariza topilmadi.", reply_markup=self.admin_menu)
+                return
+
+            update_application_status(self.db_path, app_id, "rejected", reason)
 
             try:
                 await context.bot.send_message(
-                    chat_id=rejected_user_id,
+                    chat_id=app["user_id"],
                     text=(
-                        f"Kechirasiz, {rejected_name} siz “Kunlik vakansiya” shartlaridan o‘ta olmaganingiz uchun "
+                        f"Kechirasiz, {app['name']} siz “Kunlik vakansiya” shartlaridan o‘ta olmaganingiz uchun "
                         f"hozircha sizning arizangizni qabul qila olmaymiz.\n\n"
                         f"Sabab:\n{reason}"
                     ),
@@ -927,28 +1740,43 @@ class VacancyBot:
             except Exception as exc:
                 logger.warning(f"Failed to send rejection reason: {exc}")
 
-            await update.message.reply_text("Rad etish sababi foydalanuvchiga yuborildi.")
-            return
+            await update.message.reply_text("Rad etish sababi foydalanuvchiga yuborildi.", reply_markup=self.admin_menu)
 
     async def global_photo_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.effective_user:
             return
 
         user_id = update.effective_user.id
+        booking_id = self.pending_bookings.get(user_id)
 
-        if user_id not in self.pending_bookings:
+        if not booking_id:
+            open_booking = get_latest_open_booking_for_user(self.db_path, user_id)
+            if open_booking and not open_booking.get("receipt_file_id"):
+                booking_id = open_booking["id"]
+
+        if not booking_id:
             return
 
-        booking_id = self.pending_bookings[user_id]
         receipt_file_id = update.message.photo[-1].file_id
         set_booking_receipt(self.db_path, booking_id, receipt_file_id)
 
         booking = get_booking(self.db_path, booking_id)
         if not booking:
-            await update.message.reply_text("Booking topilmadi.")
+            await update.message.reply_text("Bron ma'lumoti topilmadi.")
             return
 
         vacancy_id = booking["vacancy_id"]
+        user = get_user(self.db_path, user_id)
+        vacancy = get_vacancy(self.db_path, vacancy_id)
+
+        text = (
+            f"To'lov cheki\n"
+            f"Foydalanuvchi: {user['name'] if user else user_id}\n"
+            f"Telefon: {user['phone'] if user else '-'}\n"
+            f"Vakansiya: {vacancy['title'] if vacancy else vacancy_id}\n"
+            f"Booking ID: {booking_id}\n\n"
+            f"Tasdiqlaysizmi?"
+        )
 
         keyboard = InlineKeyboardMarkup(
             [
@@ -965,14 +1793,6 @@ class VacancyBot:
             ]
         )
 
-        text = (
-            f"To'lov cheki\n"
-            f"Foydalanuvchi ID: {user_id}\n"
-            f"Booking ID: {booking_id}\n"
-            f"Vakansiya ID: {vacancy_id}\n\n"
-            f"Tasdiqlaysizmi?"
-        )
-
         for admin_id in self.admin_ids:
             try:
                 await context.bot.send_photo(chat_id=admin_id, photo=receipt_file_id)
@@ -981,12 +1801,17 @@ class VacancyBot:
                 logger.warning(f"Failed to notify admin {admin_id} about receipt: {exc}")
 
         self.pending_bookings.pop(user_id, None)
-        await update.message.reply_text("Chek yuborildi. Admin tasdig'ini kuting.")
+        await update.message.reply_text(
+            "Chekingiz qabul qilindi. Admin tasdig'ini kuting."
+        )
 
-    # -------------------- RECEIPT ADMIN --------------------
+    # -------------------- RECEIPT REVIEW --------------------
     async def admin_confirm_receipt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
+
+        if not self.is_admin(query.from_user.id):
+            return
 
         try:
             _, vacancy_id_str, booking_id_str = query.data.split(":")
@@ -996,25 +1821,25 @@ class VacancyBot:
             await query.message.reply_text("Noto'g'ri ma'lumot.")
             return
 
+        booking = get_booking(self.db_path, booking_id)
+        if not booking:
+            await query.message.reply_text("Booking topilmadi.")
+            return
+
         set_booking_confirmed(self.db_path, booking_id, True)
         decrement_vacancy_remaining(self.db_path, vacancy_id)
 
-        booking = get_booking(self.db_path, booking_id)
-        if booking:
-            try:
-                await context.bot.send_message(
-                    chat_id=booking["user_id"],
-                    text="Bron to'lovi tasdiqlandi. Ish siz uchun bron qilindi!",
-                )
-            except Exception as exc:
-                logger.warning(f"Failed to notify user: {exc}")
-
+        await self.send_confirmed_booking_details(booking["user_id"], vacancy_id, context)
         await self.send_vacancy_remaining_notice(vacancy_id, context)
+
         await query.message.edit_text("To'lov tasdiqlandi.")
 
     async def admin_decline_receipt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
+
+        if not self.is_admin(query.from_user.id):
+            return
 
         try:
             _, vacancy_id_str, booking_id_str = query.data.split(":")
@@ -1025,15 +1850,20 @@ class VacancyBot:
             return
 
         booking = get_booking(self.db_path, booking_id)
-        if booking:
-            self.pending_bookings[booking["user_id"]] = booking_id
-            try:
-                await context.bot.send_message(
-                    chat_id=booking["user_id"],
-                    text="Kechirasiz, chek tasdiqlanmadi. Iltimos, qaytadan to'g'ri chek yuboring.",
-                )
-            except Exception as exc:
-                logger.warning(f"Failed to notify user: {exc}")
+        if not booking:
+            await query.message.reply_text("Booking topilmadi.")
+            return
+
+        clear_booking_receipt(self.db_path, booking_id)
+        self.pending_bookings[booking["user_id"]] = booking_id
+
+        try:
+            await context.bot.send_message(
+                chat_id=booking["user_id"],
+                text="Kechirasiz, chek tasdiqlanmadi. Iltimos, qaytadan to'g'ri chek yuboring.",
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to notify user about declined receipt: {exc}")
 
         await query.message.edit_text("To'lov rad etildi.")
 
