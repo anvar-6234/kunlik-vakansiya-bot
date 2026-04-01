@@ -768,9 +768,25 @@ class VacancyBot:
         context.user_data["reg_phone"] = phone
 
         offer_text = (
-            "⬇ Ommaviy oferta ⬇\n\n"
-            "Botdan foydalanish orqali siz shartlarga rozilik bildirasiz.\n"
-            "Rozi bo'lsangiz 'Roziman' tugmasini bosing."
+            "📝 Foydalanuvchi ofertasi\n\n"
+            "\"Kunlik vakansiya\" markazi tomonidan taqdim etiladigan xizmatlar va undan foydalanuvchilar orasidagi shartnoma:\n\n"
+            "1. Umumiy qoidalar.\n\n"
+            "Ushbu botdan foydalanish orqali siz quyidagi shartlarga rozilik bildirasiz.\n\n"
+            "Bizning xizmat - kunlik ishlarga nomzodlarni ish beruvchilar bilan aloqasini o'rnatish.\n\n"
+            "2. Xizmat haqi.\n\n"
+            "Har bir ish e'lonida xizmat haqi miqdori alohida ko'rsatiladi.\n\n"
+            "Nomzod ishga yozilishdan oldin ko'rsatilgan summani to'laydi va to'lov tasdig'ini (check) botga yuboradi. "
+            "Qalbaki check yuborish qat'iyan taqiqlanadi, bunday holat aniqlansa u foydalanuvchiga qaytib ish berilmaydi.\n\n"
+            "3. Majburiyatlar.\n\n"
+            "To'lovdan so'ng nomzod ishga chiqishi shart. Sababsiz chiqmaslik xizmatdan chetlashtirishga olib keladi.\n\n"
+            "Biz ish beruvchi va nomzod o'rtasidagi nizolarga hech bir ko'rinishda javobgar emasmiz, "
+            "lekin imkon qadar yordam beramiz.\n\n"
+            "4. Javobgarlik chegarasi.\n\n"
+            "Ish haqi, ish joyi sharoiti va boshqa qo'shimcha kelishuvlar uchun faqat ish beruvchi javobgar.\n\n"
+            "Bizning yagona vazifamiz - faqat kontakt bog'lash va e'lonlarni yetkazish xolos.\n\n"
+            "5. Yakuniy shartlar.\n\n"
+            "Oferta va qoidalar doimiy yangilanib boradi. Botdan foydalanish orqali siz ushbu shartlarga rozilik bildirgan bo'lasiz.\n\n"
+            "Agar rozi bo'lsangiz, pastdagi 'Roziman' tugmasini bosing."
         )
 
         keyboard = InlineKeyboardMarkup(
