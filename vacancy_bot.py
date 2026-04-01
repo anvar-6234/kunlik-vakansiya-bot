@@ -39,7 +39,6 @@ REG_NAME, REG_PHONE, REG_OFFER, REG_PASSPORT = range(4)
 (
     VAC_TITLE,
     VAC_HEADCOUNT,
-    VAC_DATE,
     VAC_LOCATION_TEXT,
     VAC_WORKTIME,
     VAC_SALARY,
@@ -48,9 +47,9 @@ REG_NAME, REG_PHONE, REG_OFFER, REG_PASSPORT = range(4)
     VAC_REVIEW,
     VAC_EDIT_CHOICE,
     VAC_EDIT_VALUE,
-) = range(10, 21)
+) = range(10, 20)
 
-MSG_TARGET_MODE, MSG_USER_ID, MSG_VACANCY_PICK, MSG_TEXT = range(30, 34)
+MSG_TARGET_MODE, MSG_USER_PICK, MSG_VACANCY_PICK, MSG_TEXT = range(30, 34)
 
 # -------------------- DATABASE HELPERS --------------------
 def now_iso() -> str:
@@ -106,7 +105,6 @@ def init_db(db_path: str) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
             headcount INTEGER,
-            date_text TEXT,
             location_text TEXT,
             work_time TEXT,
             salary TEXT,
@@ -119,11 +117,6 @@ def init_db(db_path: str) -> None:
         )
         """
     )
-
-    cur.execute("PRAGMA table_info(vacancies)")
-    vacancy_columns = [row[1] for row in cur.fetchall()]
-    if "date_text" not in vacancy_columns:
-        cur.execute("ALTER TABLE vacancies ADD COLUMN date_text TEXT DEFAULT ''")
 
     cur.execute(
         """
@@ -169,6 +162,35 @@ def get_user(db_path: str, user_id: int) -> Optional[Dict]:
         "passport_file_id": row[5],
         "approved": bool(row[6]),
     }
+
+
+def list_all_users(db_path: str, limit: int = 500) -> List[Dict]:
+    conn = get_conn(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, name, phone, username, approved
+        FROM users
+        ORDER BY updated_at DESC, created_at DESC, user_id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result: List[Dict] = []
+    for row in rows:
+        result.append(
+            {
+                "user_id": row[0],
+                "name": row[1],
+                "phone": row[2],
+                "username": row[3],
+                "approved": bool(row[4]),
+            }
+        )
+    return result
 
 
 def upsert_user(
@@ -406,7 +428,6 @@ def create_vacancy(
     db_path: str,
     title: str,
     headcount: int,
-    date_text: str,
     location_text: str,
     work_time: str,
     salary: str,
@@ -419,15 +440,14 @@ def create_vacancy(
     cur.execute(
         """
         INSERT INTO vacancies (
-            title, headcount, date_text, location_text, work_time, salary, deposit,
+            title, headcount, location_text, work_time, salary, deposit,
             latitude, longitude, channel_message_id, remaining, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         """,
         (
             title,
             headcount,
-            date_text,
             location_text,
             work_time,
             salary,
@@ -460,7 +480,7 @@ def get_vacancy(db_path: str, vacancy_id: int) -> Optional[Dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, title, headcount, date_text, location_text, work_time, salary,
+        SELECT id, title, headcount, location_text, work_time, salary,
                deposit, latitude, longitude, channel_message_id, remaining
         FROM vacancies
         WHERE id = ?
@@ -477,15 +497,14 @@ def get_vacancy(db_path: str, vacancy_id: int) -> Optional[Dict]:
         "id": row[0],
         "title": row[1],
         "headcount": row[2],
-        "date_text": row[3],
-        "location_text": row[4],
-        "work_time": row[5],
-        "salary": row[6],
-        "deposit": row[7],
-        "latitude": row[8],
-        "longitude": row[9],
-        "channel_message_id": row[10],
-        "remaining": row[11],
+        "location_text": row[3],
+        "work_time": row[4],
+        "salary": row[5],
+        "deposit": row[6],
+        "latitude": row[7],
+        "longitude": row[8],
+        "channel_message_id": row[9],
+        "remaining": row[10],
     }
 
 
@@ -494,7 +513,7 @@ def list_vacancies(db_path: str, limit: int = 50) -> List[Dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, title, headcount, date_text, location_text, work_time, salary,
+        SELECT id, title, headcount, location_text, work_time, salary,
                deposit, latitude, longitude, channel_message_id, remaining
         FROM vacancies
         ORDER BY id DESC
@@ -512,15 +531,14 @@ def list_vacancies(db_path: str, limit: int = 50) -> List[Dict]:
                 "id": row[0],
                 "title": row[1],
                 "headcount": row[2],
-                "date_text": row[3],
-                "location_text": row[4],
-                "work_time": row[5],
-                "salary": row[6],
-                "deposit": row[7],
-                "latitude": row[8],
-                "longitude": row[9],
-                "channel_message_id": row[10],
-                "remaining": row[11],
+                "location_text": row[3],
+                "work_time": row[4],
+                "salary": row[5],
+                "deposit": row[6],
+                "latitude": row[7],
+                "longitude": row[8],
+                "channel_message_id": row[9],
+                "remaining": row[10],
             }
         )
     return result
@@ -816,7 +834,6 @@ class VacancyBot:
             states={
                 VAC_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_title)],
                 VAC_HEADCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_headcount)],
-                VAC_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_date)],
                 VAC_LOCATION_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_location_text)],
                 VAC_WORKTIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_work_time)],
                 VAC_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_salary)],
@@ -826,7 +843,7 @@ class VacancyBot:
                 VAC_EDIT_CHOICE: [
                     CallbackQueryHandler(
                         self.vacancy_edit_choice_callback,
-                        pattern=r"^vac_edit:(title|headcount|date_text|location_text|work_time|salary|deposit|geo|cancel)$",
+                        pattern=r"^vac_edit:(title|headcount|location_text|work_time|salary|deposit|geo|cancel)$",
                     )
                 ],
                 VAC_EDIT_VALUE: [MessageHandler((filters.LOCATION | filters.TEXT) & ~filters.COMMAND, self.vacancy_edit_value)],
@@ -848,7 +865,10 @@ class VacancyBot:
             ],
             states={
                 MSG_TARGET_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_target_mode)],
-                MSG_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_user_id)],
+                MSG_USER_PICK: [
+                    CallbackQueryHandler(self.message_user_pick_callback, pattern=r"^msg_userpick:(\d+)$"),
+                    CallbackQueryHandler(self.message_user_page_callback, pattern=r"^msg_userpage:(\d+)$"),
+                ],
                 MSG_VACANCY_PICK: [CallbackQueryHandler(self.message_vacancy_pick_callback, pattern=r"^msg_vac:(\d+)$")],
                 MSG_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_text)],
             },
@@ -886,7 +906,6 @@ class VacancyBot:
             f"#{data['headcount']} vakansiya\n\n"
             f"Vakansiya nomi: {data['title']}\n"
             f"Necha kishi kerak: {data['headcount']}\n"
-            f"Sana: {data['date_text']}\n"
             f"Lokatsiya (yozma): {data['location_text']}\n"
             f"Ish vaqti: {data['work_time']}\n"
             f"Xizmati haqi: {data['salary']}\n"
@@ -932,7 +951,6 @@ class VacancyBot:
             self.db_path,
             title=data["title"],
             headcount=data["headcount"],
-            date_text=data["date_text"],
             location_text=data["location_text"],
             work_time=data["work_time"],
             salary=data["salary"],
@@ -1011,7 +1029,6 @@ class VacancyBot:
 
         text = (
             f"Vakansiya: {vacancy['title']}\n"
-            f"Sana: {vacancy['date_text']}\n"
             f"Lokatsiya: {vacancy['location_text']}\n"
             f"Ish vaqti: {vacancy['work_time']}\n"
             f"Xizmati haqi: {vacancy['salary']}\n"
@@ -1127,11 +1144,8 @@ class VacancyBot:
 
         if vacancy["remaining"] <= 0:
             lines.append("<b>Bu vakansiya bo'yicha ishchilar ro'yxati to'lgan:</b>")
-            lines.append(f"<b>{escape(vacancy['title'])}</b>")
-            lines.append(f"Sana: {escape(vacancy['date_text'])}")
         else:
             lines.append(f"<b>{escape(vacancy['title'])}</b>")
-            lines.append(f"Sana: {escape(vacancy['date_text'])}")
             lines.append(f"Bo'sh joy: {vacancy['remaining']}/{vacancy['headcount']}")
 
         lines.append("")
@@ -1211,6 +1225,53 @@ class VacancyBot:
         await context.bot.send_message(
             chat_id=chat_id,
             text="Vakansiyani tanlang:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def show_user_choice_for_message(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> None:
+        users = list_all_users(self.db_path, limit=500)
+        if not users:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Hali foydalanuvchilar yo'q.",
+                reply_markup=self.admin_menu,
+            )
+            return
+
+        per_page = 10
+        total_pages = max(1, (len(users) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        start = page * per_page
+        end = start + per_page
+        page_users = users[start:end]
+
+        rows: List[List[InlineKeyboardButton]] = []
+        for item in page_users:
+            label_name = item.get("name") or item.get("username") or str(item["user_id"])
+            if item.get("phone"):
+                label = f"{label_name} — {item['phone']}"
+            else:
+                label = label_name
+            if len(label) > 55:
+                label = label[:52] + "..."
+            rows.append([
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"msg_userpick:{item['user_id']}",
+                )
+            ])
+
+        nav: List[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"msg_userpage:{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"msg_userpage:{page + 1}"))
+        if nav:
+            rows.append(nav)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Foydalanuvchini tanlang: ({page + 1}/{total_pages})",
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
@@ -1299,7 +1360,6 @@ class VacancyBot:
         context.user_data["vacancy_draft"] = {
             "title": "",
             "headcount": 0,
-            "date_text": "",
             "location_text": "",
             "work_time": "",
             "salary": "",
@@ -1323,11 +1383,6 @@ class VacancyBot:
             return VAC_HEADCOUNT
 
         context.user_data["vacancy_draft"]["headcount"] = value
-        await update.message.reply_text("Sana kiriting (masalan: 5-aprel 2026 yoki 05.04.2026):")
-        return VAC_DATE
-
-    async def vacancy_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data["vacancy_draft"]["date_text"] = update.message.text.strip()
         await update.message.reply_text("Lokatsiya (yozma) kiriting:")
         return VAC_LOCATION_TEXT
 
@@ -1383,7 +1438,6 @@ class VacancyBot:
             [
                 [InlineKeyboardButton("Vakansiya nomi", callback_data="vac_edit:title")],
                 [InlineKeyboardButton("Necha kishi kerak", callback_data="vac_edit:headcount")],
-                [InlineKeyboardButton("Sana", callback_data="vac_edit:date_text")],
                 [InlineKeyboardButton("Lokatsiya (yozma)", callback_data="vac_edit:location_text")],
                 [InlineKeyboardButton("Ish vaqti", callback_data="vac_edit:work_time")],
                 [InlineKeyboardButton("Xizmati haqi", callback_data="vac_edit:salary")],
@@ -1412,7 +1466,6 @@ class VacancyBot:
         prompts = {
             "title": "Yangi vakansiya nomini kiriting:",
             "headcount": "Yangi kishi sonini kiriting:",
-            "date_text": "Yangi sanani kiriting:",
             "location_text": "Yangi lokatsiya (yozma) ni kiriting:",
             "work_time": "Yangi ish vaqtini kiriting:",
             "salary": "Yangi xizmat haqini kiriting:",
@@ -1755,11 +1808,8 @@ class VacancyBot:
 
         if text == "Bitta foydalanuvchiga":
             context.user_data["message_mode"] = "single"
-            await update.message.reply_text(
-                "Foydalanuvchi Telegram ID sini yuboring:",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            return MSG_USER_ID
+            await self.show_user_choice_for_message(update.effective_chat.id, context, page=0)
+            return MSG_USER_PICK
 
         if text == "Bron qilganlarga":
             context.user_data["message_mode"] = "confirmed"
@@ -1774,19 +1824,34 @@ class VacancyBot:
         await update.message.reply_text("Tugmalardan birini tanlang.", reply_markup=self.message_target_menu)
         return MSG_TARGET_MODE
 
-    async def message_user_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def message_user_pick_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+
         try:
-            user_id = int(update.message.text.strip())
-        except ValueError:
-            await update.message.reply_text("Iltimos, raqam yuboring.")
-            return MSG_USER_ID
+            user_id = int(query.data.split(":")[1])
+        except (IndexError, ValueError):
+            await query.message.reply_text("Noto'g'ri foydalanuvchi.")
+            return MSG_USER_PICK
 
         context.user_data["message_target_users"] = [user_id]
-        await update.message.reply_text(
+        await query.message.reply_text(
             "Yuboriladigan xabar matnini yozing:",
             reply_markup=ReplyKeyboardRemove(),
         )
         return MSG_TEXT
+
+    async def message_user_page_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+
+        try:
+            page = int(query.data.split(":")[1])
+        except (IndexError, ValueError):
+            page = 0
+
+        await self.show_user_choice_for_message(query.message.chat_id, context, page=page)
+        return MSG_USER_PICK
 
     async def message_vacancy_pick_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
