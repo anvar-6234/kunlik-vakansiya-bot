@@ -2,7 +2,7 @@
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from telegram import (
@@ -32,8 +32,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------- STATES --------------------
-
 (REG_NAME, REG_PHONE, REG_OFFER, REG_PASSPORT) = range(4)
+
 (
     VAC_TITLE,
     VAC_HEADCOUNT,
@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 
 
 # -------------------- DATABASE --------------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def init_db(db_path: str) -> None:
@@ -173,7 +175,7 @@ def upsert_user(
         else (existing["pending_vacancy_id"] if existing else None)
     )
 
-    now = datetime.utcnow().isoformat()
+    now = now_iso()
 
     conn = get_conn(db_path)
     cur = conn.cursor()
@@ -242,7 +244,7 @@ def add_vacancy(
             longitude,
             channel_message_id,
             headcount,
-            datetime.utcnow().isoformat(),
+            now_iso(),
         ),
     )
     vacancy_id = cur.lastrowid
@@ -312,7 +314,7 @@ def add_booking(db_path: str, vacancy_id: int, user_id: int) -> int:
         INSERT INTO bookings (vacancy_id, user_id, created_at)
         VALUES (?, ?, ?)
         """,
-        (vacancy_id, user_id, datetime.utcnow().isoformat()),
+        (vacancy_id, user_id, now_iso()),
     )
     booking_id = cur.lastrowid
     conn.commit()
@@ -363,8 +365,6 @@ def set_booking_confirmed(db_path: str, booking_id: int, confirmed: bool) -> Non
 
 
 # -------------------- BOT --------------------
-
-
 class VacancyBot:
     def __init__(self) -> None:
         self.token = os.environ.get("BOT_TOKEN")
@@ -394,8 +394,8 @@ class VacancyBot:
         init_db(self.db_path)
 
         self.application = Application.builder().token(self.token).build()
-
         self.pending_bookings: Dict[int, int] = {}
+
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -403,7 +403,7 @@ class VacancyBot:
             entry_points=[CommandHandler("start", self.start_entry)],
             states={
                 REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.reg_name)],
-                REG_PHONE: [MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), self.reg_phone)],
+                REG_PHONE: [MessageHandler((filters.CONTACT | filters.TEXT) & ~filters.COMMAND, self.reg_phone)],
                 REG_OFFER: [CallbackQueryHandler(self.reg_offer_response, pattern=r"^(accept_offer|decline_offer)$")],
                 REG_PASSPORT: [MessageHandler(filters.PHOTO, self.reg_passport)],
             },
@@ -416,7 +416,11 @@ class VacancyBot:
 
         vacancy_conv = ConversationHandler(
             entry_points=[
-                CommandHandler("new_vacancy", self.new_vacancy_entry, filters=filters.User(user_id=self.admin_ids))
+                CommandHandler(
+                    "new_vacancy",
+                    self.new_vacancy_entry,
+                    filters=filters.User(user_id=self.admin_ids),
+                )
             ],
             states={
                 VAC_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.vacancy_title)],
@@ -451,7 +455,6 @@ class VacancyBot:
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.generic_text_handler))
 
     # -------------------- HELPERS --------------------
-
     async def send_booking_payment_message(
         self,
         chat_id: int,
@@ -522,6 +525,7 @@ class VacancyBot:
             return
 
         remaining = vacancy["remaining"]
+
         if remaining <= 0:
             try:
                 await context.bot.edit_message_text(
@@ -552,7 +556,6 @@ class VacancyBot:
                 logger.warning(f"Remaining notice failed: {exc}")
 
     # -------------------- GENERAL --------------------
-
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if update.message:
             await update.message.reply_text("Jarayon bekor qilindi.", reply_markup=ReplyKeyboardRemove())
@@ -564,6 +567,8 @@ class VacancyBot:
 
         user = update.effective_user
         payload = context.args[0] if context.args else None
+
+        logger.info("START payload from user %s: %s", user.id, payload)
 
         if payload and payload.startswith("book_"):
             try:
@@ -598,12 +603,11 @@ class VacancyBot:
         await update.message.reply_text(
             "Assalomu alaykum! 👋\n\n"
             "Bu bot orqali kunlik vakansiyalarni ko'rishingiz va ishni bron qilishingiz mumkin. "
-            "Vakansiyalarni ko'rish uchun kanaldagi e'lon ostidagi 'Ishni bron qilish' tugmasini bosing."
+            "Kanaldagi 'Ishni bron qilish' tugmasini bosing."
         )
         return ConversationHandler.END
 
     # -------------------- VACANCY CREATION --------------------
-
     async def new_vacancy_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message:
             return ConversationHandler.END
@@ -737,7 +741,6 @@ class VacancyBot:
         return ConversationHandler.END
 
     # -------------------- REGISTRATION --------------------
-
     async def reg_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["reg_name"] = update.message.text.strip()
 
@@ -756,33 +759,33 @@ class VacancyBot:
         )
         return REG_PHONE
 
-        async def reg_phone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-            if update.message.contact:
-                phone = update.message.contact.phone_number
-            else:
-                phone = update.message.text.strip()
-    
-            context.user_data["reg_phone"] = phone
-    
-            offer_text = (
-                "⬇ Ommaviy oferta ⬇\n\n"
-                "Botdan foydalanish orqali siz shartlarga rozilik bildirasiz.\n"
-                "Rozi bo'lsangiz 'Roziman' tugmasini bosing."
-            )
-    
-            keyboard = InlineKeyboardMarkup(
+    async def reg_phone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message.contact:
+            phone = update.message.contact.phone_number
+        else:
+            phone = update.message.text.strip()
+
+        context.user_data["reg_phone"] = phone
+
+        offer_text = (
+            "⬇ Ommaviy oferta ⬇\n\n"
+            "Botdan foydalanish orqali siz shartlarga rozilik bildirasiz.\n"
+            "Rozi bo'lsangiz 'Roziman' tugmasini bosing."
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            [
                 [
-                    [
-                        InlineKeyboardButton("Roziman", callback_data="accept_offer"),
-                        InlineKeyboardButton("Rad etaman", callback_data="decline_offer"),
-                    ]
+                    InlineKeyboardButton("Roziman", callback_data="accept_offer"),
+                    InlineKeyboardButton("Rad etaman", callback_data="decline_offer"),
                 ]
-            )
-    
-            await update.message.reply_text(
-                offer_text,
-                reply_markup=keyboard,
-            )
+            ]
+        )
+
+        await update.message.reply_text(
+            offer_text,
+            reply_markup=keyboard,
+        )
         return REG_OFFER
 
     async def reg_offer_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -847,7 +850,6 @@ class VacancyBot:
         return ConversationHandler.END
 
     # -------------------- ADMIN APPROVAL --------------------
-
     async def admin_approve_registration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -885,7 +887,6 @@ class VacancyBot:
             pass
 
     # -------------------- TEXT / PHOTO GLOBAL --------------------
-
     async def generic_text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.effective_user:
             return
@@ -895,14 +896,15 @@ class VacancyBot:
         if user_id in self.admin_ids and "pending_rejection_user" in context.chat_data:
             rejected_user_id = context.chat_data.pop("pending_rejection_user")
             reason = update.message.text.strip()
+            rejected_user = get_user(self.db_path, rejected_user_id)
+            rejected_name = rejected_user["name"] if rejected_user and rejected_user.get("name") else "foydalanuvchi"
 
             try:
                 await context.bot.send_message(
                     chat_id=rejected_user_id,
                     text=(
-                        f"Kechirasiz, {get_user(self.db_path, rejected_user_id)['name']} siz "
-                        f"“Kunlik vakansiya” shartlaridan o‘ta olmaganingiz uchun hozircha "
-                        f"sizning arizangizni qabul qila olmaymiz.\n\n"
+                        f"Kechirasiz, {rejected_name} siz “Kunlik vakansiya” shartlaridan o‘ta olmaganingiz uchun "
+                        f"hozircha sizning arizangizni qabul qila olmaymiz.\n\n"
                         f"Sabab:\n{reason}"
                     ),
                 )
@@ -966,7 +968,6 @@ class VacancyBot:
         await update.message.reply_text("Chek yuborildi. Admin tasdig'ini kuting.")
 
     # -------------------- RECEIPT ADMIN --------------------
-
     async def admin_confirm_receipt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -1001,7 +1002,7 @@ class VacancyBot:
 
         try:
             _, vacancy_id_str, booking_id_str = query.data.split(":")
-            _ = int(vacancy_id_str)
+            int(vacancy_id_str)
             booking_id = int(booking_id_str)
         except (ValueError, IndexError):
             await query.message.reply_text("Noto'g'ri ma'lumot.")
@@ -1021,7 +1022,6 @@ class VacancyBot:
         await query.message.edit_text("To'lov rad etildi.")
 
     # -------------------- RUN --------------------
-
     def run(self) -> None:
         logger.info("Bot started")
         self.application.run_polling(drop_pending_updates=True)
