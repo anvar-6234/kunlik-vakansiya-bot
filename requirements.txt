@@ -1,3 +1,2 @@
 python-telegram-bot==20.7
-aiosignal>=1.2
-httpx[socks]>=0.20
+httpx==0.25.2
