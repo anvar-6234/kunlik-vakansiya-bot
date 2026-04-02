@@ -3,7 +3,7 @@ Kunlik Vakansiya Telegram Bot — Production-Level
 ==================================================
 Telegram kanal orqali kunlik vakansiyalar e'lon qilish,
 foydalanuvchilarni ro'yxatdan o'tkazish, admin tasdiqlash,
-to'lov tekshiruvi va bron qilish tizimi.
+to'lov tekshiruvi va band qilish tizimi.
 
 Stack: Python 3.12 + python-telegram-bot 20.7 + SQLite
 """
@@ -55,7 +55,7 @@ CHANNEL_ID: int = int(os.environ.get("CHANNEL_ID", "0"))
 CARD_NUMBER: str = os.environ.get("CARD_NUMBER", "4916990356074515")
 CARD_HOLDER: str = os.environ.get("CARD_HOLDER", "Anvarxon Mansurov")
 DATA_DIR: str = os.environ.get("DATA_DIR", "data")
-CHANNEL_PUBLIC_USERNAME: str = os.environ.get("CHANNEL_PUBLIC_USERNAME", "")
+CHANNEL_PUBLIC_USERNAME: str = os.environ.get("CHANNEL_PUBLIC_USERNAME", "").lstrip("@")
 
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot.db")
@@ -69,12 +69,10 @@ REG_NAME, REG_PHONE, REG_OFFERTA, REG_PASSPORT = range(4)
 # Vacancy creation
 (
     VAC_TITLE, VAC_HEADCOUNT, VAC_DATE, VAC_LOCATION,
-    VAC_WORKTIME, VAC_SALARY, VAC_DEPOSIT, VAC_GEO,
-    VAC_PREVIEW, VAC_EDIT_CHOOSE, VAC_EDIT_VALUE,
-) = range(10, 21)
-
-# Admin rejection reason
-ADM_REJECT_REASON = 30
+    VAC_WORKTIME, VAC_SALARY, VAC_DEPOSIT, VAC_MEAL,
+    VAC_NOTE, VAC_GEO, VAC_PREVIEW, VAC_EDIT_CHOOSE,
+    VAC_EDIT_VALUE,
+) = range(10, 23)
 
 # Admin messaging
 MSG_CHOOSE_TARGET, MSG_CHOOSE_VACANCY, MSG_CHOOSE_USER, MSG_TEXT = range(40, 44)
@@ -131,7 +129,8 @@ def init_db() -> None:
     conn = _get_conn()
     c = conn.cursor()
 
-    c.execute("""
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             user_id     INTEGER PRIMARY KEY,
             name        TEXT,
@@ -143,9 +142,11 @@ def init_db() -> None:
             created_at  TEXT,
             updated_at  TEXT
         )
-    """)
+        """
+    )
 
-    c.execute("""
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS applications (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id         INTEGER NOT NULL,
@@ -160,9 +161,11 @@ def init_db() -> None:
             created_at      TEXT,
             updated_at      TEXT
         )
-    """)
+        """
+    )
 
-    c.execute("""
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS vacancies (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             title               TEXT NOT NULL,
@@ -172,15 +175,19 @@ def init_db() -> None:
             work_time           TEXT,
             salary              TEXT,
             deposit             TEXT,
+            meal_text           TEXT,
+            note_text           TEXT,
             latitude            REAL,
             longitude           REAL,
             channel_message_id  INTEGER,
             remaining           INTEGER,
             created_at          TEXT
         )
-    """)
+        """
+    )
 
-    c.execute("""
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS bookings (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             vacancy_id      INTEGER NOT NULL,
@@ -189,22 +196,21 @@ def init_db() -> None:
             confirmed       INTEGER DEFAULT 0,
             created_at      TEXT
         )
-    """)
+        """
+    )
 
-    # ── migrations ──
     _migrate(conn)
-
     conn.commit()
     conn.close()
     logger.info("Database initialized at %s", DB_PATH)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Add missing columns if upgrading from older schema."""
     cursor = conn.cursor()
     tables_cols: dict[str, list[tuple[str, str]]] = {
         "users": [("updated_at", "TEXT")],
         "applications": [("updated_at", "TEXT"), ("vacancy_id", "INTEGER")],
+        "vacancies": [("meal_text", "TEXT"), ("note_text", "TEXT")],
     }
     for table, cols in tables_cols.items():
         existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
@@ -302,17 +308,17 @@ def db_get_application(app_id: int) -> dict | None:
 
 def db_create_vacancy(title: str, headcount: int, date_text: str,
                       location_text: str, work_time: str, salary: str,
-                      deposit: str, latitude: float | None,
-                      longitude: float | None) -> int:
+                      deposit: str, meal_text: str, note_text: str,
+                      latitude: float | None, longitude: float | None) -> int:
     conn = _get_conn()
     now = _now()
     cur = conn.execute(
         """INSERT INTO vacancies
            (title, headcount, date_text, location_text, work_time, salary, deposit,
-            latitude, longitude, remaining, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            meal_text, note_text, latitude, longitude, remaining, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (title, headcount, date_text, location_text, work_time, salary, deposit,
-         latitude, longitude, headcount, now),
+         meal_text, note_text, latitude, longitude, headcount, now),
     )
     vid = cur.lastrowid
     conn.commit()
@@ -437,20 +443,48 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def vacancy_text(v: dict) -> str:
-    return (
-        f"#{v['id']} vakansiya\n\n"
-        f"Vakansiya nomi: {v['title']}\n"
-        f"Necha kishi kerak: {v['headcount']}\n"
-        f"Sana: {v['date_text']}\n"
-        f"Lokatsiya (yozma): {v['location_text']}\n"
-        f"Ish vaqti: {v['work_time']}\n"
-        f"Xizmati haqi: {v['salary']}\n"
-        f"Bron qilish narxi: {v['deposit']} so'm"
-    )
+    parts = [
+        f"🆕 #{v['id']} sonli vakansiya",
+        "",
+        f"💸 Ish haqi: {v['salary']}",
+        f"💼 Ish: {v['title']}",
+        f"💳 Band qilish narxi: {v['deposit']} so'm",
+        f"👥 Ishchi soni: {v['headcount']}",
+        f"📅 Sana: {v['date_text']}",
+        f"⏰ Ish vaqti: {v['work_time']}",
+        f"🍽 Taomlanish: {v.get('meal_text') or 'Ko\'rsatilmagan'}",
+        f"📍 Manzil: {v['location_text']}",
+    ]
+    if v.get("note_text"):
+        parts.append(f"📝 Izoh: {v['note_text']}")
+    if v.get("latitude") and v.get("longitude"):
+        parts.append("📌 Lokatsiya 👇")
+    return "\n".join(parts)
+
+
+def vacancy_preview_text(v: dict) -> str:
+    parts = [
+        "📋 PREVIEW",
+        "",
+        f"💼 Ish: {v['title']}",
+        f"👥 Ishchi soni: {v['headcount']}",
+        f"📅 Sana: {v['date_text']}",
+        f"📍 Manzil: {v['location_text']}",
+        f"⏰ Ish vaqti: {v['work_time']}",
+        f"💸 Ish haqi: {v['salary']}",
+        f"💳 Band qilish narxi: {v['deposit']} so'm",
+        f"🍽 Taomlanish: {v.get('meal_text') or 'Ko\'rsatilmagan'}",
+    ]
+    if v.get("note_text"):
+        parts.append(f"📝 Izoh: {v['note_text']}")
+    if v.get("latitude") and v.get("longitude"):
+        parts.append("📌 Geolokatsiya qo'shilgan")
+    else:
+        parts.append("📌 Geolokatsiya yo'q")
+    return "\n".join(parts)
 
 
 def vacancy_link(v: dict) -> str:
-    """Return a clickable link to the channel post if possible."""
     if CHANNEL_PUBLIC_USERNAME and v.get("channel_message_id"):
         return f"https://t.me/{CHANNEL_PUBLIC_USERNAME}/{v['channel_message_id']}"
     return ""
@@ -458,7 +492,7 @@ def vacancy_link(v: dict) -> str:
 
 def booking_inline_button(vacancy_id: int) -> InlineKeyboardMarkup:
     url = f"https://t.me/{BOT_USERNAME}?start=book_{vacancy_id}"
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📋 Ishni bron qilish", url=url)]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📌 Ishni band qilish", url=url)]])
 
 
 def user_mention(u: dict) -> str:
@@ -484,18 +518,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     args = context.args or []
 
-    # ── admin start ──
     if is_admin(user.id):
         await update.message.reply_text(
             f"Salom, Admin {user.first_name}! 👋\nQuyidagi menyudan foydalaning:",
             reply_markup=admin_reply_keyboard(),
         )
-        # If admin also clicked a deep link, handle it
-        if args and args[0].startswith("book_"):
-            pass  # admins don't book
         return ConversationHandler.END
 
-    # ── deep link: book_<vacancy_id> ──
     vacancy_id = None
     if args and args[0].startswith("book_"):
         try:
@@ -505,18 +534,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     db_user = db_get_user(user.id)
 
-    # Approved user → skip registration
     if db_user and db_user.get("approved"):
         if vacancy_id:
             await _start_payment_flow(update, context, user.id, vacancy_id)
         else:
             await update.message.reply_text(
                 "Salom! Siz allaqachon ro'yxatdan o'tgansiz ✅\n"
-                "Kanaldagi vakansiyalardan birini tanlang va \"Ishni bron qilish\" tugmasini bosing."
+                "Kanaldagi vakansiyalardan birini tanlang va \"Ishni band qilish\" tugmasini bosing."
             )
         return ConversationHandler.END
 
-    # Not approved → start registration
     db_upsert_user(user.id, username=user.username)
     context.user_data["reg_vacancy_id"] = vacancy_id
 
@@ -601,7 +628,6 @@ async def reg_passport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     phone = context.user_data.get("reg_phone", "")
     vacancy_id = context.user_data.get("reg_vacancy_id")
 
-    # Save user
     db_upsert_user(
         user.id,
         name=name,
@@ -611,7 +637,6 @@ async def reg_passport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         passport_file_id=file_id,
     )
 
-    # Create application
     app_id = db_create_application(
         user_id=user.id,
         vacancy_id=vacancy_id,
@@ -627,12 +652,11 @@ async def reg_passport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "⏳ Admin tekshiruvidan o'tishingizni kuting. Tez orada javob beramiz!"
     )
 
-    # ── notify admins ──
     vac_text = ""
     if vacancy_id:
         v = db_get_vacancy(vacancy_id)
         if v:
-            vac_text = f"Vakansiya: #{v['id']} — {v['title']}\n"
+            vac_text = f"Vacansiya: #{v['id']} — {v['title']}\n"
 
     caption = (
         f"#APP{app_id} yangi foydalanuvchi arizasi:\n\n"
@@ -689,13 +713,12 @@ async def app_approve_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text=(
                 f"Hurmatli {name} sizni Kunlik vakansiya jamoasiga "
                 f"qabul qilinganingiz bilan tabriklayman.\n\n"
-                f"Quyida ish bilan batafsil tanishishingiz va bron qilishingiz mumkin!"
+                f"Quyida ish bilan batafsil tanishishingiz va band qilishingiz mumkin!"
             ),
         )
     except Exception as e:
         logger.error("Failed to send welcome to %s: %s", app["user_id"], e)
 
-    # If application was for a specific vacancy, start payment flow
     if app.get("vacancy_id"):
         v = db_get_vacancy(app["vacancy_id"])
         if v and v["remaining"] > 0:
@@ -730,7 +753,6 @@ async def app_reject_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Called from the general text handler when admin is typing rejection reason."""
     reason = update.message.text.strip()
     app_id = context.user_data.pop("reject_app_id", None)
     app_name = context.user_data.pop("reject_app_name", "foydalanuvchi")
@@ -742,7 +764,7 @@ async def _handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TY
 
     db_update_application(app_id, status="rejected", rejection_reason=reason)
 
-    await update.message.reply_text(f"✅ Sabab saqlandi va foydalanuvchiga yuborildi.")
+    await update.message.reply_text("✅ Sabab saqlandi va foydalanuvchiga yuborildi.")
 
     try:
         await context.bot.send_message(
@@ -763,7 +785,6 @@ async def _handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def _start_payment_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                               user_id: int, vacancy_id: int) -> None:
-    """Entry point for approved user clicking a vacancy deep link."""
     v = db_get_vacancy(vacancy_id)
     if not v:
         await update.message.reply_text("⚠️ Vakansiya topilmadi.")
@@ -772,13 +793,11 @@ async def _start_payment_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Bu vakansiyada bo'sh joy qolmagan.")
         return
 
-    # Check if already confirmed
     existing = db_get_user_confirmed_booking(user_id, vacancy_id)
     if existing:
-        await update.message.reply_text("✅ Siz bu vakansiyani allaqachon bron qilgansiz!")
+        await update.message.reply_text("✅ Siz bu vakansiyani allaqachon band qilgansiz!")
         return
 
-    # Check if pending booking exists
     pending = db_get_user_pending_booking(user_id, vacancy_id)
     if pending and pending.get("receipt_file_id"):
         await update.message.reply_text("⏳ Sizning chekingiz tekshirilmoqda. Kuting.")
@@ -790,11 +809,10 @@ async def _start_payment_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _send_payment_info(context: ContextTypes.DEFAULT_TYPE,
                              user_id: int, v: dict) -> None:
-    """Send vacancy details + card info to user."""
     text = (
         f"{vacancy_text(v)}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Ishni bron qilishingiz uchun quyidagi kartaga bron summasini o'tkazing:\n\n"
+        f"Ishni band qilishingiz uchun quyidagi kartaga band summasini o'tkazing:\n\n"
         f"💳 {CARD_NUMBER}\n"
         f"👤 {CARD_HOLDER}\n"
         f"💰 Summa: {v['deposit']} so'm\n\n"
@@ -807,18 +825,22 @@ async def _send_payment_info(context: ContextTypes.DEFAULT_TYPE,
 
 
 # ══════════════════════════════════════════════
-#  PHOTO HANDLER  (passport during reg is handled by ConversationHandler)
-#  This handles RECEIPT photos from approved users
+#  PHOTO HANDLER
 # ══════════════════════════════════════════════
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+
+    if is_admin(user.id) and context.user_data.get("msg_send_mode"):
+        await _send_admin_location_or_text(update, context)
+        return
+
     if is_admin(user.id):
-        return  # admins don't send receipts
+        return
 
     db_user = db_get_user(user.id)
     if not db_user or not db_user.get("approved"):
-        return  # not approved, ignore
+        return
 
     photo = update.message.photo[-1]
     file_id = photo.file_id
@@ -827,7 +849,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not vacancy_id:
         await update.message.reply_text(
             "⚠️ Qaysi vakansiya uchun chek yuborayotganingiz aniqlanmadi.\n"
-            "Kanaldagi vakansiyadan \"Ishni bron qilish\" tugmasini bosing."
+            "Kanaldagi vakansiyadan \"Ishni band qilish\" tugmasini bosing."
         )
         return
 
@@ -839,13 +861,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("❌ Bu vakansiyada bo'sh joy qolmagan.")
         return
 
-    # Check duplicate
     existing_confirmed = db_get_user_confirmed_booking(user.id, vacancy_id)
     if existing_confirmed:
-        await update.message.reply_text("✅ Siz bu vakansiyani allaqachon bron qilgansiz!")
+        await update.message.reply_text("✅ Siz bu vakansiyani allaqachon band qilgansiz!")
         return
 
-    # Create or update booking
     pending = db_get_user_pending_booking(user.id, vacancy_id)
     if pending:
         db_update_booking(pending["id"], receipt_file_id=file_id)
@@ -856,7 +876,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text("✅ Chekingiz qabul qilindi! Admin tekshiruvini kuting.")
 
-    # Notify admins
     caption = (
         f"💳 To'lov cheki\n\n"
         f"Foydalanuvchi: {db_user.get('name', '—')}\n"
@@ -902,28 +921,21 @@ async def pay_approve_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await query.edit_message_caption(query.message.caption + "\n\n✅ TO'LOV TASDIQLANDI")
 
-    # ── notify user ──
     name = db_user.get("name", "foydalanuvchi") if db_user else "foydalanuvchi"
     vac_link = vacancy_link(v)
-    if vac_link:
-        vac_ref = f'<a href="{vac_link}">{html.escape(v["title"])}</a>'
-    else:
-        vac_ref = v["title"]
+    vac_ref = f'<a href="{vac_link}">{html.escape(v["title"])}</a>' if vac_link else html.escape(v["title"])
 
     msg_text = (
-        f"Hurmatli {html.escape(name)}, siz {vac_ref} ishi uchun joy bron qildingiz.\n\n"
+        f"Hurmatli {html.escape(name)}, siz {vac_ref} ishi uchun joy band qildingiz.\n\n"
         f"Pastda qo'shimcha tafsilotlar va lokatsiya yuboryapman, "
         f"iltimos aytilgan joyga kechikmay keling!"
     )
     try:
         await context.bot.send_message(
             chat_id=booking["user_id"], text=msg_text, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
-        # Send vacancy details
-        await context.bot.send_message(
-            chat_id=booking["user_id"], text=vacancy_text(v),
-        )
-        # Send location if available
+        await context.bot.send_message(chat_id=booking["user_id"], text=vacancy_text(v))
         if v.get("latitude") and v.get("longitude"):
             await context.bot.send_location(
                 chat_id=booking["user_id"],
@@ -933,20 +945,18 @@ async def pay_approve_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error("Failed to notify user %s: %s", booking["user_id"], e)
 
-    # ── update channel ──
     remaining = v["remaining"]
     if remaining > 0:
         try:
             await context.bot.send_message(
                 chat_id=CHANNEL_ID,
-                text=f"🔥 Vakansiya uchun {remaining}/{v['headcount']} bo'sh joy qoldi, shoshiling!",
+                text=f"🔥 Vakansiya uchun {remaining} bo'sh joy qoldi, shoshiling!",
                 reply_to_message_id=v.get("channel_message_id"),
                 reply_markup=booking_inline_button(v["id"]),
             )
         except Exception as e:
             logger.error("Failed to reply to channel: %s", e)
     else:
-        # Close vacancy
         try:
             closed_text = vacancy_text(v) + "\n\n❌ Ish joylari qolmadi! Rahmat )"
             await context.bot.edit_message_text(
@@ -970,7 +980,7 @@ async def pay_reject_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_caption("⚠️ Booking topilmadi.")
         return
 
-    db_update_booking(bid, receipt_file_id=None)  # allow re-upload
+    db_update_booking(bid, receipt_file_id=None)
 
     await query.edit_message_caption(query.message.caption + "\n\n❌ TO'LOV RAD ETILDI")
 
@@ -1045,12 +1055,25 @@ async def vac_worktime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def vac_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["vac"]["salary"] = update.message.text.strip()
-    await update.message.reply_text("💳 Bron qilish narxini kiriting (masalan: 15,000):")
+    await update.message.reply_text("💳 Band qilish narxini kiriting (masalan: 15,000):")
     return VAC_DEPOSIT
 
 
 async def vac_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["vac"]["deposit"] = update.message.text.strip()
+    await update.message.reply_text("🍽 Taomlanish bormi? (masalan: Bor / Yo'q / 1 mahal)")
+    return VAC_MEAL
+
+
+async def vac_meal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["vac"]["meal_text"] = update.message.text.strip()
+    await update.message.reply_text("📝 Izoh kiriting (yo'q bo'lsa '-' deb yozing):")
+    return VAC_NOTE
+
+
+async def vac_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    note = update.message.text.strip()
+    context.user_data["vac"]["note_text"] = "" if note == "-" else note
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭ O'tkazib yuborish", callback_data="geo_skip")],
     ])
@@ -1084,21 +1107,20 @@ async def vac_geo_skip_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def _show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     d = context.user_data["vac"]
-    geo_line = ""
-    if d.get("latitude"):
-        geo_line = "\n📍 Geolokatsiya qo'shilgan"
-
-    preview = (
-        f"📋 PREVIEW\n\n"
-        f"Vakansiya nomi: {d['title']}\n"
-        f"Necha kishi kerak: {d['headcount']}\n"
-        f"Sana: {d['date_text']}\n"
-        f"Lokatsiya (yozma): {d['location_text']}\n"
-        f"Ish vaqti: {d['work_time']}\n"
-        f"Xizmati haqi: {d['salary']}\n"
-        f"Bron qilish narxi: {d['deposit']} so'm"
-        f"{geo_line}"
-    )
+    preview = vacancy_preview_text({
+        "id": "Z",
+        "title": d["title"],
+        "headcount": d["headcount"],
+        "date_text": d["date_text"],
+        "location_text": d["location_text"],
+        "work_time": d["work_time"],
+        "salary": d["salary"],
+        "deposit": d["deposit"],
+        "meal_text": d.get("meal_text", ""),
+        "note_text": d.get("note_text", ""),
+        "latitude": d.get("latitude"),
+        "longitude": d.get("longitude"),
+    })
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Tasdiqlayman ✅", callback_data="vac_confirm")],
         [InlineKeyboardButton("Tasdiqlamayman ❌", callback_data="vac_edit")],
@@ -1121,6 +1143,8 @@ async def vac_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         work_time=d["work_time"],
         salary=d["salary"],
         deposit=d["deposit"],
+        meal_text=d.get("meal_text", ""),
+        note_text=d.get("note_text", ""),
         latitude=d.get("latitude"),
         longitude=d.get("longitude"),
     )
@@ -1151,13 +1175,15 @@ async def vac_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     query = update.callback_query
     await query.answer()
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Vakansiya nomi", callback_data="vedit_title")],
-        [InlineKeyboardButton("Necha kishi", callback_data="vedit_headcount")],
+        [InlineKeyboardButton("Ish", callback_data="vedit_title")],
+        [InlineKeyboardButton("Ishchi soni", callback_data="vedit_headcount")],
         [InlineKeyboardButton("Sana", callback_data="vedit_date_text")],
-        [InlineKeyboardButton("Lokatsiya", callback_data="vedit_location_text")],
+        [InlineKeyboardButton("Manzil", callback_data="vedit_location_text")],
         [InlineKeyboardButton("Ish vaqti", callback_data="vedit_work_time")],
-        [InlineKeyboardButton("Xizmati haqi", callback_data="vedit_salary")],
-        [InlineKeyboardButton("Bron narxi", callback_data="vedit_deposit")],
+        [InlineKeyboardButton("Ish haqi", callback_data="vedit_salary")],
+        [InlineKeyboardButton("Band narxi", callback_data="vedit_deposit")],
+        [InlineKeyboardButton("Taomlanish", callback_data="vedit_meal_text")],
+        [InlineKeyboardButton("Izoh", callback_data="vedit_note_text")],
         [InlineKeyboardButton("Geolokatsiya", callback_data="vedit_geo")],
         [InlineKeyboardButton("❌ Bekor qilish", callback_data="vedit_cancel")],
     ])
@@ -1184,13 +1210,15 @@ async def vac_edit_choose_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return VAC_GEO
 
     labels = {
-        "title": "Vakansiya nomi",
-        "headcount": "Necha kishi kerak (raqam)",
+        "title": "Ish",
+        "headcount": "Ishchi soni",
         "date_text": "Sana",
-        "location_text": "Lokatsiya (yozma)",
+        "location_text": "Manzil",
         "work_time": "Ish vaqti",
-        "salary": "Xizmati haqi",
-        "deposit": "Bron qilish narxi",
+        "salary": "Ish haqi",
+        "deposit": "Band narxi",
+        "meal_text": "Taomlanish",
+        "note_text": "Izoh",
     }
     context.user_data["vac_editing_field"] = field
     await query.edit_message_text(f"Yangi qiymatni kiriting — {labels.get(field, field)}:")
@@ -1212,6 +1240,9 @@ async def vac_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("⚠️ Iltimos, to'g'ri raqam kiriting:")
             context.user_data["vac_editing_field"] = field
             return VAC_EDIT_VALUE
+
+    if field == "note_text" and value == "-":
+        value = ""
 
     context.user_data["vac"][field] = value
     return await _show_preview(update, context)
@@ -1260,16 +1291,14 @@ async def stats_vacancy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     confirmed_bookings = db_get_bookings_for_vacancy(vid, confirmed=1)
     pending_bookings = db_get_bookings_for_vacancy(vid, confirmed=0)
-    # Filter pending that have receipt
     pending_with_receipt = [b for b in pending_bookings if b.get("receipt_file_id")]
     pending_no_receipt = [b for b in pending_bookings if not b.get("receipt_file_id")]
 
     text = f"📊 #{v['id']} — {v['title']}\n"
-    text += f"Sana: {v['date_text']}\n"
-    text += f"Bo'sh joylar: {v['remaining']}/{v['headcount']}\n\n"
+    text += f"📅 Sana: {v['date_text']}\n"
+    text += f"📌 Bo'sh joylar: {v['remaining']}/{v['headcount']}\n\n"
 
-    # Confirmed
-    text += f"✅ Bron qilganlar: {len(confirmed_bookings)}\n"
+    text += f"✅ Band qilganlar: {len(confirmed_bookings)}\n"
     buttons = []
     for i, b in enumerate(confirmed_bookings, 1):
         u = db_get_user(b["user_id"])
@@ -1281,7 +1310,6 @@ async def stats_vacancy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     callback_data=f"showcheck_{b['id']}",
                 )])
 
-    # Pending with receipt
     if pending_with_receipt:
         text += f"\n⏳ Cheki tekshirilmoqda: {len(pending_with_receipt)}\n"
         for i, b in enumerate(pending_with_receipt, 1):
@@ -1293,7 +1321,6 @@ async def stats_vacancy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     callback_data=f"showcheck_{b['id']}",
                 )])
 
-    # Pending without receipt
     if pending_no_receipt:
         text += f"\n🕐 Chek kutilmoqda: {len(pending_no_receipt)}\n"
         for i, b in enumerate(pending_no_receipt, 1):
@@ -1339,7 +1366,7 @@ async def msg_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Bitta foydalanuvchiga", callback_data="msgt_one")],
-        [InlineKeyboardButton("✅ Vakansiya bron qilganlarga", callback_data="msgt_confirmed")],
+        [InlineKeyboardButton("✅ Vakansiya band qilganlarga", callback_data="msgt_confirmed")],
         [InlineKeyboardButton("⏳ Vakansiya pendingdagilarga", callback_data="msgt_pending")],
         [InlineKeyboardButton("❌ Bekor qilish", callback_data="msgt_cancel")],
     ])
@@ -1363,10 +1390,8 @@ async def msg_target_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data["msg_target"] = target
 
     if target == "one":
-        # Show user list with pagination
         return await _show_user_list(query, context, page=0)
     else:
-        # Show vacancy list
         vacancies = db_get_all_vacancies()
         if not vacancies:
             await query.edit_message_text("Vakansiyalar yo'q.")
@@ -1436,7 +1461,11 @@ async def msg_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     context.user_data["msg_recipients"] = [uid]
     u = db_get_user(uid)
     name = u.get("name", "?") if u else "?"
-    await query.edit_message_text(f"Tanlandi: {name}\n\nYuboriladigan xabarni yozing:")
+    context.user_data["msg_send_mode"] = True
+    await query.edit_message_text(
+        f"Tanlandi: {name}\n\n"
+        f"Endi yuboriladigan matnni yozing YOKI geolokatsiya yuboring:"
+    )
     return MSG_TEXT
 
 
@@ -1455,7 +1484,7 @@ async def msg_vacancy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if target == "confirmed":
         bookings = db_get_bookings_for_vacancy(vid, confirmed=1)
-    else:  # pending
+    else:
         bookings = db_get_bookings_for_vacancy(vid, confirmed=0)
 
     recipients = [b["user_id"] for b in bookings]
@@ -1465,24 +1494,45 @@ async def msg_vacancy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
     context.user_data["msg_recipients"] = recipients
+    context.user_data["msg_send_mode"] = True
     await query.edit_message_text(
-        f"{len(recipients)} ta foydalanuvchiga xabar yuboriladi.\n\nXabar matnini yozing:"
+        f"{len(recipients)} ta foydalanuvchiga xabar yuboriladi.\n\n"
+        f"Endi matn yozing YOKI geolokatsiya yuboring:"
     )
     return MSG_TEXT
 
 
 async def msg_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
+    return await _send_admin_location_or_text(update, context)
+
+
+async def _send_admin_location_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     recipients = context.user_data.get("msg_recipients", [])
+    if not recipients:
+        await update.message.reply_text("Qabul qiluvchilar topilmadi.", reply_markup=admin_reply_keyboard())
+        context.user_data.pop("msg_send_mode", None)
+        return ConversationHandler.END
 
     sent = 0
     failed = 0
-    for uid in recipients:
-        try:
-            await context.bot.send_message(chat_id=uid, text=text)
-            sent += 1
-        except Exception:
-            failed += 1
+
+    if update.message.location:
+        lat = update.message.location.latitude
+        lon = update.message.location.longitude
+        for uid in recipients:
+            try:
+                await context.bot.send_location(chat_id=uid, latitude=lat, longitude=lon)
+                sent += 1
+            except Exception:
+                failed += 1
+    else:
+        text = update.message.text.strip()
+        for uid in recipients:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                sent += 1
+            except Exception:
+                failed += 1
 
     await update.message.reply_text(
         f"✅ Yuborildi: {sent}\n❌ Yuborilmadi: {failed}",
@@ -1490,10 +1540,12 @@ async def msg_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
     context.user_data.pop("msg_recipients", None)
     context.user_data.pop("msg_target", None)
+    context.user_data.pop("msg_send_mode", None)
     return ConversationHandler.END
 
 
 async def msg_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("msg_send_mode", None)
     await update.message.reply_text("❌ Bekor qilindi.", reply_markup=admin_reply_keyboard())
     return ConversationHandler.END
 
@@ -1505,19 +1557,21 @@ async def msg_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
 
-    # Admin rejection reason
     if is_admin(user.id) and context.user_data.get("awaiting_reject_reason"):
         await _handle_reject_reason(update, context)
         return
 
-    # Non-admin users
+    if is_admin(user.id) and context.user_data.get("msg_send_mode"):
+        await _send_admin_location_or_text(update, context)
+        return
+
     if not is_admin(user.id):
         db_user = db_get_user(user.id)
         if not db_user:
             await update.message.reply_text("Iltimos, /start buyrug'ini yuboring.")
         elif db_user.get("approved"):
             await update.message.reply_text(
-                "Kanaldagi vakansiyalarni ko'ring va \"Ishni bron qilish\" tugmasini bosing."
+                "Kanaldagi vakansiyalarni ko'ring va \"Ishni band qilish\" tugmasini bosing."
             )
         else:
             await update.message.reply_text("⏳ Sizning arizangiz ko'rib chiqilmoqda.")
@@ -1573,7 +1627,6 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ── Registration conversation ──
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -1589,7 +1642,6 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # ── Vacancy creation conversation ──
     vac_conv = ConversationHandler(
         entry_points=[
             MessageHandler(
@@ -1606,6 +1658,8 @@ def main() -> None:
             VAC_WORKTIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, vac_worktime)],
             VAC_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, vac_salary)],
             VAC_DEPOSIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vac_deposit)],
+            VAC_MEAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, vac_meal)],
+            VAC_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, vac_note)],
             VAC_GEO: [
                 MessageHandler(filters.LOCATION, vac_geo_received),
                 CallbackQueryHandler(vac_geo_skip_cb, pattern=r"^geo_skip$"),
@@ -1624,7 +1678,6 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", vac_cancel)],
     )
 
-    # ── Admin messaging conversation ──
     msg_conv = ConversationHandler(
         entry_points=[
             MessageHandler(
@@ -1645,17 +1698,16 @@ def main() -> None:
             ],
             MSG_TEXT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_send_text),
+                MessageHandler(filters.LOCATION, msg_send_text),
             ],
         },
         fallbacks=[CommandHandler("cancel", msg_cancel)],
     )
 
-    # ── Register handlers (ORDER MATTERS) ──
     app.add_handler(vac_conv)
     app.add_handler(msg_conv)
     app.add_handler(reg_conv)
 
-    # Callback queries (outside conversations)
     app.add_handler(CallbackQueryHandler(app_approve_cb, pattern=r"^app_approve_"))
     app.add_handler(CallbackQueryHandler(app_reject_cb, pattern=r"^app_reject_"))
     app.add_handler(CallbackQueryHandler(pay_approve_cb, pattern=r"^pay_approve_"))
@@ -1663,24 +1715,17 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(stats_vacancy_cb, pattern=r"^stat_"))
     app.add_handler(CallbackQueryHandler(show_check_cb, pattern=r"^showcheck_"))
 
-    # Commands
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # Stats button
     app.add_handler(MessageHandler(
         filters.Regex(r"(?i)📊\s*statistika") & filters.ChatType.PRIVATE,
         stats_start,
     ))
 
-    # Photo handler (receipts from approved users)
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo))
-
-    # General text handler (catch-all)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_text))
-
-    # Error handler
     app.add_error_handler(error_handler)
 
     logger.info("Bot starting... (polling)")
